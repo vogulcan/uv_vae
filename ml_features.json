@@ -1,0 +1,321 @@
+{
+  "features": [
+    {
+      "name": "REF",
+      "type": "c",
+      "values": {
+        "A": 0,
+        "C": 1,
+        "G": 2,
+        "T": 3,
+        "R": 4,
+        "Y": 5,
+        "K": 6,
+        "M": 7,
+        "S": 8,
+        "W": 9,
+        "B": 10,
+        "D": 11,
+        "H": 12,
+        "V": 13,
+        "N": 14,
+        "": 15
+      }
+    },
+    {
+      "name": "ALT",
+      "type": "c",
+      "values": {
+        "A": 0,
+        "C": 1,
+        "G": 2,
+        "T": 3,
+        "": 4
+      }
+    },
+    {
+      "name": "X_PREV1",
+      "type": "c",
+      "values": {
+        "A": 0,
+        "B": 1,
+        "C": 2,
+        "D": 3,
+        "G": 4,
+        "H": 5,
+        "K": 6,
+        "M": 7,
+        "N": 8,
+        "R": 9,
+        "S": 10,
+        "T": 11,
+        "V": 12,
+        "W": 13,
+        "Y": 14,
+        "": 15
+      }
+    },
+    {
+      "name": "X_NEXT1",
+      "type": "c",
+      "values": {
+        "A": 0,
+        "B": 1,
+        "C": 2,
+        "D": 3,
+        "G": 4,
+        "H": 5,
+        "K": 6,
+        "M": 7,
+        "N": 8,
+        "R": 9,
+        "S": 10,
+        "T": 11,
+        "V": 12,
+        "W": 13,
+        "Y": 14,
+        "": 15
+      }
+    },
+    {
+      "name": "X_PREV2",
+      "type": "c",
+      "values": {
+        "A": 0,
+        "B": 1,
+        "C": 2,
+        "D": 3,
+        "G": 4,
+        "H": 5,
+        "K": 6,
+        "M": 7,
+        "N": 8,
+        "R": 9,
+        "S": 10,
+        "T": 11,
+        "V": 12,
+        "W": 13,
+        "Y": 14,
+        "": 15
+      }
+    },
+    {
+      "name": "X_NEXT2",
+      "type": "c",
+      "values": {
+        "A": 0,
+        "B": 1,
+        "C": 2,
+        "D": 3,
+        "G": 4,
+        "H": 5,
+        "K": 6,
+        "M": 7,
+        "N": 8,
+        "R": 9,
+        "S": 10,
+        "T": 11,
+        "V": 12,
+        "W": 13,
+        "Y": 14,
+        "": 15
+      }
+    },
+    {
+      "name": "X_PREV3",
+      "type": "c",
+      "values": {
+        "A": 0,
+        "B": 1,
+        "C": 2,
+        "D": 3,
+        "G": 4,
+        "H": 5,
+        "K": 6,
+        "M": 7,
+        "N": 8,
+        "R": 9,
+        "S": 10,
+        "T": 11,
+        "V": 12,
+        "W": 13,
+        "Y": 14,
+        "": 15
+      }
+    },
+    {
+      "name": "X_NEXT3",
+      "type": "c",
+      "values": {
+        "A": 0,
+        "B": 1,
+        "C": 2,
+        "D": 3,
+        "G": 4,
+        "H": 5,
+        "K": 6,
+        "M": 7,
+        "N": 8,
+        "R": 9,
+        "S": 10,
+        "T": 11,
+        "V": 12,
+        "W": 13,
+        "Y": 14,
+        "": 15
+      }
+    },
+    {
+      "name": "X_HMER_REF",
+      "type": "int"
+    },
+    {
+      "name": "X_HMER_ALT",
+      "type": "int"
+    },
+    {
+      "name": "BCSQ",
+      "type": "int"
+    },
+    {
+      "name": "BCSQCSS",
+      "type": "int"
+    },
+    {
+      "name": "RL",
+      "type": "int"
+    },
+    {
+      "name": "INDEX",
+      "type": "int"
+    },
+    {
+      "name": "REV",
+      "type": "int"
+    },
+    {
+      "name": "SCST",
+      "type": "int"
+    },
+    {
+      "name": "SCED",
+      "type": "int"
+    },
+    {
+      "name": "SMQ_BEFORE",
+      "type": "int"
+    },
+    {
+      "name": "SMQ_AFTER",
+      "type": "int"
+    },
+    {
+      "name": "tm",
+      "type": "c",
+      "values": {
+        "A": 0,
+        "AQ": 1,
+        "AQZ": 2,
+        "AZ": 3,
+        "Q": 4,
+        "QZ": 5,
+        "Z": 6,
+        "": 7
+      }
+    },
+    {
+      "name": "rq",
+      "type": "float"
+    },
+    {
+      "name": "st",
+      "type": "c",
+      "values": {
+        "MINUS": 0,
+        "MIXED": 1,
+        "PLUS": 2,
+        "UNDETERMINED": 3,
+        "": 4
+      }
+    },
+    {
+      "name": "et",
+      "type": "c",
+      "values": {
+        "MINUS": 0,
+        "MIXED": 1,
+        "PLUS": 2,
+        "UNDETERMINED": 3,
+        "": 4
+      }
+    },
+    {
+      "name": "sd",
+      "type": "float"
+    },
+    {
+      "name": "ed",
+      "type": "float"
+    },
+    {
+      "name": "l1",
+      "type": "float"
+    },
+    {
+      "name": "l2",
+      "type": "float"
+    },
+    {
+      "name": "l3",
+      "type": "float"
+    },
+    {
+      "name": "l4",
+      "type": "float"
+    },
+    {
+      "name": "l5",
+      "type": "float"
+    },
+    {
+      "name": "l6",
+      "type": "float"
+    },
+    {
+      "name": "l7",
+      "type": "float"
+    },
+    {
+      "name": "q2",
+      "type": "float"
+    },
+    {
+      "name": "q3",
+      "type": "float"
+    },
+    {
+      "name": "q4",
+      "type": "float"
+    },
+    {
+      "name": "q5",
+      "type": "float"
+    },
+    {
+      "name": "q6",
+      "type": "float"
+    },
+    {
+      "name": "EDIST",
+      "type": "int"
+    },
+    {
+      "name": "HAMDIST",
+      "type": "int"
+    },
+    {
+      "name": "HAMDIST_FILT",
+      "type": "int"
+    }
+  ]
+}
