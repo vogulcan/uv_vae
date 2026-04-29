@@ -3,8 +3,17 @@ set -euo pipefail
 
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
-RUN_ROOT="/home/carlos/Clone/uv_vae/artifacts/wt0-1_${TIMESTAMP}"
-PARQUET_PATH="/home/carlos/Clone/uv_vae/data/wt0-1-ppm0001.featuremap.parquet"
+UV_PATH="${UV_PATH:-}"
+if [[ -z "$UV_PATH" ]]; then
+  UV_PATH="$(command -v uv || true)"
+fi
+if [[ -z "$UV_PATH" || ! -x "$UV_PATH" ]]; then
+  echo "Unable to find executable uv. Set UV_PATH=/path/to/uv and rerun." >&2
+  exit 1
+fi
+
+RUN_ROOT="/home/carlos/Clone/uv_vae/artifacts/ddbR9-b2_${TIMESTAMP}"
+PARQUET_PATH="/home/carlos/Clone/uv_vae/data/ddbR9-b2-ppm0029.featuremap.parquet"
 FEATURE_SPEC_PATH="/home/carlos/Clone/uv_vae/ml_features.json"
 TRAIN_OUTPUT_DIR="${RUN_ROOT}/training"
 CLUSTER_OUTPUT_ROOT="${RUN_ROOT}/clustering"
@@ -19,8 +28,10 @@ TRAIN_HIDDEN_DIMS="512,256,128"
 TRAIN_LEARNING_RATE=1e-3
 TRAIN_KL_WEIGHT=0.05
 TRAIN_FRACTION=0.9
-TRAIN_SEED=42
+PIPELINE_SEED=42
+TRAIN_SEED="$PIPELINE_SEED"
 TRAIN_THREADS=8
+CLUSTER_SEED="$PIPELINE_SEED"
 CLUSTER_USE_ALL=1
 CLUSTER_SAMPLE_ROWS=1000000
 CLUSTER_THREADS=8
@@ -41,6 +52,7 @@ DUCKDB_MEMORY_LIMIT=12GB
 COLOR_COLUMNS="BCSQ,RAW_VAF,DP,SMQ_BEFORE,SMQ_AFTER,EDIST,MAPQ,SNVQ"
 
 export RUN_ROOT
+export UV_PATH
 export PARQUET_PATH
 export FEATURE_SPEC_PATH
 export TRAIN_OUTPUT_DIR
@@ -55,8 +67,10 @@ export TRAIN_HIDDEN_DIMS
 export TRAIN_LEARNING_RATE
 export TRAIN_KL_WEIGHT
 export TRAIN_FRACTION
+export PIPELINE_SEED
 export TRAIN_SEED
 export TRAIN_THREADS
+export CLUSTER_SEED
 export CLUSTER_USE_ALL
 export CLUSTER_SAMPLE_ROWS
 export CLUSTER_THREADS
@@ -76,13 +90,20 @@ export GENOME_BUILD
 export DUCKDB_MEMORY_LIMIT
 export COLOR_COLUMNS
 
+export PYTHONHASHSEED="${PYTHONHASHSEED:-$PIPELINE_SEED}"
+export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+
 bash scripts/run_train_then_cluster.sh --cluster-row-filter "$CLUSTER_ROW_FILTER"
 
 minSNVQ=40
 maxSNVQ=999
-uv run python scripts/plot_trinuc96_snvq_histograms.py \
+"$UV_PATH" run python scripts/plot_trinuc96_snvq_histograms.py \
   --parquet-path "$PARQUET_PATH" \
   --row-filter "st = 'MIXED' AND et = 'MIXED' AND FILT = 1" \
   --min-snvq "$minSNVQ" \
   --max-snvq "$maxSNVQ" \
-  --output-path "${RUN_ROOT}/trinuc96_snvq_histograms.png" \
+  --output-path "${RUN_ROOT}/trinuc96_snvq_histograms.png"

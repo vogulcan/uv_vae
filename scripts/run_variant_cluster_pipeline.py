@@ -89,6 +89,11 @@ def sql_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def stable_order_by(columns: list[str]) -> str:
+    order_columns = ["row_index"] if "row_index" in columns else columns
+    return ", ".join(f"{quote_ident(name)} ASC NULLS LAST" for name in order_columns)
+
+
 def utc_timestamp() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
@@ -210,6 +215,8 @@ def write_deduplicated_sample(
 ) -> tuple[int, int]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     select_list = ", ".join(quote_ident(name) for name in selected_columns)
+    output_order = stable_order_by(selected_columns)
+    tie_break_order = stable_order_by(selected_columns)
     table_name = "deduplicated_variants"
     dedup_sql = f"""
         CREATE OR REPLACE TEMP TABLE {table_name} AS
@@ -223,7 +230,8 @@ def write_deduplicated_sample(
                         "QUAL" DESC NULLS LAST,
                         "MAPQ" DESC NULLS LAST,
                         "DP" DESC NULLS LAST,
-                        "RAW_VAF" DESC NULLS LAST
+                        "RAW_VAF" DESC NULLS LAST,
+                        {tie_break_order}
                 ) AS rn
             FROM read_parquet({sql_quote(str(parquet_path))})
             WHERE {row_filter}
@@ -252,16 +260,22 @@ def write_deduplicated_sample(
                 COPY (
                     SELECT {select_list}
                     FROM {table_name}
+                    ORDER BY {output_order}
                 ) TO {sql_quote(str(output_path))} (FORMAT PARQUET, COMPRESSION ZSTD)
             """
         else:
             actual_sample_rows = min(sample_rows, dedup_population)
+            conn.execute("SET threads = 1")
             copy_sql = f"""
                 COPY (
                     SELECT {select_list}
-                    FROM {table_name}
-                    USING SAMPLE reservoir({int(actual_sample_rows)} ROWS)
-                    REPEATABLE ({int(seed)})
+                    FROM (
+                        SELECT {select_list}
+                        FROM {table_name}
+                        USING SAMPLE reservoir({int(actual_sample_rows)} ROWS)
+                        REPEATABLE ({int(seed)})
+                    ) AS sampled_rows
+                    ORDER BY {output_order}
                 ) TO {sql_quote(str(output_path))} (FORMAT PARQUET, COMPRESSION ZSTD)
             """
         conn.execute(copy_sql)
@@ -281,16 +295,20 @@ def sample_parquet_exact(
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     select_list = "*" if selected_columns is None else ", ".join(quote_ident(name) for name in selected_columns)
+    order_clause = "" if selected_columns is None else f"\n            ORDER BY {stable_order_by(selected_columns)}"
     sql = f"""
         COPY (
             SELECT {select_list}
-            FROM read_parquet({sql_quote(str(source_path))})
-            USING SAMPLE reservoir({int(sample_rows)} ROWS)
-            REPEATABLE ({int(seed)})
+            FROM (
+                SELECT {select_list}
+                FROM read_parquet({sql_quote(str(source_path))})
+                USING SAMPLE reservoir({int(sample_rows)} ROWS)
+                REPEATABLE ({int(seed)})
+            ) AS sampled_rows{order_clause}
         ) TO {sql_quote(str(output_path))} (FORMAT PARQUET, COMPRESSION ZSTD)
     """
     with connect_duckdb(
-        threads=threads,
+        threads=1,
         database=database_path or ":memory:",
         temp_directory=temp_directory,
         memory_limit=memory_limit,
@@ -397,6 +415,7 @@ def fit_umap_and_hdbscan(
     metric: str,
     min_cluster_size: int,
     min_samples: int,
+    seed: int,
 ) -> tuple[UMAP, hdbscan.HDBSCAN, pl.DataFrame]:
     latent_columns = [name for name in pq.read_schema(fit_sample_path).names if name.startswith("latent_")]
     if not latent_columns:
@@ -408,7 +427,8 @@ def fit_umap_and_hdbscan(
         n_neighbors=n_neighbors,
         min_dist=min_dist,
         metric=metric,
-        random_state=42,
+        random_state=seed,
+        transform_seed=seed,
     )
     fit_coords = umap_model.fit_transform(latent_matrix).astype(np.float32, copy=False)
     clusterer = hdbscan.HDBSCAN(
@@ -416,6 +436,7 @@ def fit_umap_and_hdbscan(
         min_samples=min_samples,
         cluster_selection_method="eom",
         metric="euclidean",
+        core_dist_n_jobs=1,
         prediction_data=True,
     )
     clusterer.fit(fit_coords)
@@ -436,7 +457,9 @@ def transform_embeddings_to_analysis(
     analysis_path: Path,
     umap_model: UMAP,
     clusterer: hdbscan.HDBSCAN,
-    fit_assignments: dict[int, tuple[int, float]],
+    fit_assignment_rows: np.ndarray,
+    fit_assignment_labels: np.ndarray,
+    fit_assignment_strengths: np.ndarray,
     passthrough_columns: list[str],
     scan_batch_rows: int,
     threads: int,
@@ -468,12 +491,15 @@ def transform_embeddings_to_analysis(
                 strengths = strengths.astype(np.float32, copy=False)
 
                 row_indices = frame["row_index"].to_numpy()
-                for index, row_index in enumerate(row_indices):
-                    fit_assignment = fit_assignments.get(int(row_index))
-                    if fit_assignment is None:
-                        continue
-                    labels[index] = np.int32(fit_assignment[0])
-                    strengths[index] = np.float32(fit_assignment[1])
+                positions = np.searchsorted(fit_assignment_rows, row_indices)
+                valid_positions = positions < fit_assignment_rows.size
+                fit_mask = np.zeros(row_indices.shape, dtype=bool)
+                fit_mask[valid_positions] = (
+                    fit_assignment_rows[positions[valid_positions]] == row_indices[valid_positions]
+                )
+                if fit_mask.any():
+                    labels[fit_mask] = fit_assignment_labels[positions[fit_mask]]
+                    strengths[fit_mask] = fit_assignment_strengths[positions[fit_mask]]
 
                 output_frame = frame.select(output_columns).with_columns(
                     [
@@ -1208,7 +1234,7 @@ def main() -> int:
     log(
         f"Configured row_filter={row_filter!r}, sample_rows={requested_sample_label}, "
         f"umap_fit_rows={args.umap_fit_rows:,}, plot_rows={args.plot_rows:,}, "
-        f"threads={args.threads}, duckdb_memory_limit={args.duckdb_memory_limit}"
+        f"seed={args.seed}, threads={args.threads}, duckdb_memory_limit={args.duckdb_memory_limit}"
     )
 
     sampled_dedup_path = output_root / "sampled_deduplicated_variants.parquet"
@@ -1315,6 +1341,7 @@ def main() -> int:
         metric=args.umap_metric,
         min_cluster_size=args.hdbscan_min_cluster_size,
         min_samples=args.hdbscan_min_samples,
+        seed=args.seed,
     )
     fit_cluster_labels = fit_df["cluster_label"].cast(pl.Int32)
     fit_cluster_count = len({int(value) for value in fit_cluster_labels.to_list() if int(value) >= 0})
@@ -1330,10 +1357,10 @@ def main() -> int:
         fit_df=fit_df,
     )
     log(f"Saved predictor state to {predictor_state_dir}")
-    fit_assignments = {
-        int(row["row_index"]): (int(row["cluster_label"]), float(row["cluster_probability"]))
-        for row in fit_df.select(["row_index", "cluster_label", "cluster_probability"]).to_dicts()
-    }
+    fit_assignment_df = fit_df.select(["row_index", "cluster_label", "cluster_probability"]).sort("row_index")
+    fit_assignment_rows = fit_assignment_df["row_index"].to_numpy()
+    fit_assignment_labels = fit_assignment_df["cluster_label"].cast(pl.Int32).to_numpy()
+    fit_assignment_strengths = fit_assignment_df["cluster_probability"].cast(pl.Float32).to_numpy()
 
     transform_start = perf_counter()
     log("Transforming all embeddings into UMAP space and assigning HDBSCAN labels")
@@ -1342,7 +1369,9 @@ def main() -> int:
         analysis_path=analysis_path,
         umap_model=umap_model,
         clusterer=clusterer,
-        fit_assignments=fit_assignments,
+        fit_assignment_rows=fit_assignment_rows,
+        fit_assignment_labels=fit_assignment_labels,
+        fit_assignment_strengths=fit_assignment_strengths,
         passthrough_columns=passthrough_columns,
         scan_batch_rows=args.scan_batch_rows,
         threads=args.threads,
@@ -1458,6 +1487,9 @@ def main() -> int:
         "parquet_path": str(parquet_path),
         "output_root": str(output_root),
         "row_filter": row_filter,
+        "seed": args.seed,
+        "deterministic_sampling_threads": 1,
+        "hdbscan_core_dist_n_jobs": 1,
         "use_all": args.use_all,
         "requested_sample_rows": requested_sample_rows,
         "sample_rows": sampled_rows,

@@ -44,6 +44,16 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+UV_PATH="${UV_PATH:-}"
+if [[ -z "$UV_PATH" ]]; then
+  UV_PATH="$(command -v uv || true)"
+fi
+if [[ -z "$UV_PATH" || ! -x "$UV_PATH" ]]; then
+  echo "Unable to find executable uv. Set UV_PATH=/path/to/uv and rerun." >&2
+  exit 1
+fi
+export UV_PATH
+
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_ROOT="${RUN_ROOT:-$REPO_ROOT/artifacts/train_then_cluster_${TIMESTAMP}}"
 
@@ -64,6 +74,7 @@ TRAIN_FRACTION="${TRAIN_FRACTION:-0.9}"
 TRAIN_SEED="${TRAIN_SEED:-42}"
 TRAIN_THREADS="${TRAIN_THREADS:-12}"
 
+CLUSTER_SEED="${CLUSTER_SEED:-$TRAIN_SEED}"
 CLUSTER_SAMPLE_ROWS="${CLUSTER_SAMPLE_ROWS:-1000000}"
 CLUSTER_USE_ALL="${CLUSTER_USE_ALL:-0}"
 CLUSTER_THREADS="${CLUSTER_THREADS:-12}"
@@ -82,6 +93,13 @@ COSMIC_VERSION="${COSMIC_VERSION:-3.5}"
 GENOME_BUILD="${GENOME_BUILD:-GRCh38}"
 DUCKDB_MEMORY_LIMIT="${DUCKDB_MEMORY_LIMIT:-4GB}"
 COLOR_COLUMNS="${COLOR_COLUMNS:-BCSQ,RAW_VAF,DP,SMQ_BEFORE,SMQ_AFTER,EDIST,MAPQ,SNVQ}"
+
+export PYTHONHASHSEED="${PYTHONHASHSEED:-$TRAIN_SEED}"
+export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 
 TRAIN_JSON="$(mktemp)"
 cleanup() {
@@ -108,24 +126,34 @@ echo "Training pipeline output dir: $TRAIN_OUTPUT_DIR"
 echo "Clustering pipeline output dir: $CLUSTER_OUTPUT_ROOT"
 echo "Clustering row filter: $CLUSTER_ROW_FILTER"
 
-uv run python scripts/run_model_training_pipeline.py \
-  --parquet-path "$PARQUET_PATH" \
-  --feature-spec-path "$FEATURE_SPEC_PATH" \
-  --output-dir "$TRAIN_OUTPUT_DIR" \
-  --row-filter "$TRAIN_ROW_FILTER" \
-  --epochs "$TRAIN_EPOCHS" \
-  --batch-size "$TRAIN_BATCH_SIZE" \
-  --latent-dim "$TRAIN_LATENT_DIM" \
-  --hidden-dims "$TRAIN_HIDDEN_DIMS" \
-  --learning-rate "$TRAIN_LEARNING_RATE" \
-  --kl-weight "$TRAIN_KL_WEIGHT" \
-  --train-fraction "$TRAIN_FRACTION" \
-  --seed "$TRAIN_SEED" \
-  --threads "$TRAIN_THREADS" \
-  "${TRAIN_SAMPLE_ARGS[@]}" | tee "$TRAIN_JSON"
+if [[ -n "${MODEL_PATH:-}" ]]; then
+  if [[ ! -f "$MODEL_PATH" ]]; then
+    echo "Configured MODEL_PATH does not exist: $MODEL_PATH" >&2
+    exit 1
+  fi
+  MODEL_PATH="$(cd "$(dirname "$MODEL_PATH")" && pwd)/$(basename "$MODEL_PATH")"
+  TRAIN_RUN_DIR="$(dirname "$MODEL_PATH")"
+  echo "Skipping training and using existing checkpoint: $MODEL_PATH"
+else
+  "$UV_PATH" run python scripts/run_model_training_pipeline.py \
+    --parquet-path "$PARQUET_PATH" \
+    --feature-spec-path "$FEATURE_SPEC_PATH" \
+    --output-dir "$TRAIN_OUTPUT_DIR" \
+    --row-filter "$TRAIN_ROW_FILTER" \
+    --epochs "$TRAIN_EPOCHS" \
+    --batch-size "$TRAIN_BATCH_SIZE" \
+    --latent-dim "$TRAIN_LATENT_DIM" \
+    --hidden-dims "$TRAIN_HIDDEN_DIMS" \
+    --learning-rate "$TRAIN_LEARNING_RATE" \
+    --kl-weight "$TRAIN_KL_WEIGHT" \
+    --train-fraction "$TRAIN_FRACTION" \
+    --seed "$TRAIN_SEED" \
+    --threads "$TRAIN_THREADS" \
+    "${TRAIN_SAMPLE_ARGS[@]}" > "$TRAIN_JSON"
+  cat "$TRAIN_JSON"
 
-TRAIN_RUN_DIR="$(
-  uv run python - "$TRAIN_JSON" <<'PY'
+  TRAIN_RUN_DIR="$(
+    "$UV_PATH" run python - "$TRAIN_JSON" <<'PY'
 import json
 import sys
 
@@ -133,21 +161,23 @@ with open(sys.argv[1], "r", encoding="utf-8") as handle:
     payload = json.load(handle)
 print(payload["run_dir"])
 PY
-)"
+  )"
 
-MODEL_PATH="$TRAIN_RUN_DIR/model.pt"
-if [[ ! -f "$MODEL_PATH" ]]; then
-  echo "Expected checkpoint was not created: $MODEL_PATH" >&2
-  exit 1
+  MODEL_PATH="$TRAIN_RUN_DIR/model.pt"
+  if [[ ! -f "$MODEL_PATH" ]]; then
+    echo "Expected checkpoint was not created: $MODEL_PATH" >&2
+    exit 1
+  fi
 fi
 
 echo "Using trained checkpoint: $MODEL_PATH"
 
-uv run python scripts/run_variant_cluster_pipeline.py \
+"$UV_PATH" run python scripts/run_variant_cluster_pipeline.py \
   --checkpoint-path "$MODEL_PATH" \
   --parquet-path "$PARQUET_PATH" \
   --row-filter "$CLUSTER_ROW_FILTER" \
   --output-root "$CLUSTER_OUTPUT_ROOT" \
+  --seed "$CLUSTER_SEED" \
   --threads "$CLUSTER_THREADS" \
   --device "$DEVICE" \
   --embed-batch-size "$EMBED_BATCH_SIZE" \

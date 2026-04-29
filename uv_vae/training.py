@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -41,11 +42,18 @@ class TrainingConfig:
 
 
 def seed_everything(seed: int) -> None:
+    os.environ.setdefault("PYTHONHASHSEED", str(seed))
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.allow_tf32 = False
+    torch.use_deterministic_algorithms(True)
 
 
 def build_model(prepared: PreparedTensors, hidden_dims: list[int], latent_dim: int) -> TabularVAE:
@@ -191,12 +199,13 @@ def train(config: TrainingConfig) -> Path:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
-        torch.set_float32_matmul_precision("high")
+        torch.set_float32_matmul_precision("highest")
 
     train_loader = DataLoader(
         TensorDataset(prepared.train_cat, prepared.train_num, prepared.train_mask),
         batch_size=config.batch_size,
         shuffle=True,
+        generator=torch.Generator().manual_seed(config.seed),
         num_workers=0,
         pin_memory=device.type == "cuda",
     )

@@ -39,6 +39,9 @@ bash scripts/run_train_then_cluster.sh --cluster-row-filter "st = 'MIXED' AND et
 
 Paths:
 
+- `UV_PATH`
+  Default: resolved from `command -v uv`
+  Path to the `uv` executable used by `run.sh` and `run_train_then_cluster.sh`.
 - `RUN_ROOT`
   Default: `artifacts/train_then_cluster_<utc timestamp>`
   Root directory for the combined training+clustering run. The script creates the training and clustering outputs under this path unless you override them separately.
@@ -54,10 +57,28 @@ Paths:
 - `CLUSTER_OUTPUT_ROOT`
   Default: `${RUN_ROOT}/clustering`
   Output root passed to the clustering pipeline. UMAP, HDBSCAN, SigProfiler, and plot artifacts are written here.
+- `MODEL_PATH`
+  Default: unset
+  Optional existing `model.pt` checkpoint. When set, `run_train_then_cluster.sh` skips training and starts from clustering.
 - `CLUSTER_ROW_FILTER`
   Example default in `scripts/run.sh`: `st = 'MIXED' AND et = 'MIXED' AND FILT = 1`
   Shell variable used by `scripts/run.sh` when it calls `bash scripts/run_train_then_cluster.sh --cluster-row-filter "$CLUSTER_ROW_FILTER"`.
   This is not read implicitly by `run_train_then_cluster.sh`; the script only uses the explicit CLI argument.
+
+Reproducibility:
+
+- `PIPELINE_SEED`
+  Example default in `scripts/run.sh`: `42`
+  Convenience seed used by `scripts/run.sh` to set both `TRAIN_SEED` and `CLUSTER_SEED`.
+- `PYTHONHASHSEED`
+  Default: `${TRAIN_SEED}` in `run_train_then_cluster.sh` when not already set.
+  Python hash seed exported before Python subprocesses start.
+- `CUBLAS_WORKSPACE_CONFIG`
+  Default: `:4096:8` in `run_train_then_cluster.sh` when not already set.
+  CUDA workspace setting used by PyTorch deterministic mode.
+- `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `NUMEXPR_NUM_THREADS`
+  Default: `1` in `run_train_then_cluster.sh` when not already set.
+  CPU numerical-library thread counts pinned for stricter reproducibility.
 
 Training:
 
@@ -101,6 +122,9 @@ Training:
 
 Clustering:
 
+- `CLUSTER_SEED`
+  Default: `${TRAIN_SEED}`
+  Random seed passed to the clustering pipeline for deduplicated sampling, UMAP-fit sampling, UMAP initialization, and plot sampling.
 - `CLUSTER_USE_ALL`
   Default: `0`
   If `1`, clustering uses the full deduplicated population.
@@ -110,7 +134,7 @@ Clustering:
   Number of deduplicated variants sampled before embedding and clustering.
 - `CLUSTER_THREADS`
   Default: `12`
-  DuckDB thread count for deduplication, parquet sampling, aggregation queries, and parquet reads in the clustering pipeline.
+  DuckDB thread count for deduplication, aggregation queries, and parquet reads in the clustering pipeline. Seeded sampling steps force DuckDB to one thread for reproducibility.
 - `DEVICE`
   Default: `auto`
   Inference device for latent embedding generation. `auto` selects CUDA when available, otherwise CPU.
