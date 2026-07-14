@@ -4,6 +4,7 @@ from pathlib import Path
 
 import duckdb
 import polars as pl
+import pyarrow.parquet as pq
 
 from uv_vae.features import FeatureSpec
 
@@ -123,7 +124,14 @@ def stream_parquet_batches(
     where: str | None = None,
     limit: int | None = None,
 ):
-    select_list = ", ".join(quote_ident(name) for name in select_columns)
+    available_columns = set(pq.read_schema(parquet_path).names)
+    matched_columns = [name for name in select_columns if name in available_columns]
+    if not matched_columns:
+        raise RuntimeError(
+            f"None of the requested columns {select_columns} exist in {parquet_path}. "
+            f"Available columns: {sorted(available_columns)}"
+        )
+    select_list = ", ".join(quote_ident(name) for name in matched_columns)
     sql = build_parquet_select_sql(
         f"SELECT {select_list}",
         where=where,

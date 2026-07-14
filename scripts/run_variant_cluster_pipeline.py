@@ -454,7 +454,7 @@ def fit_umap_and_hdbscan(
             pl.Series("cluster_probability", clusterer.probabilities_.astype(np.float32, copy=False)),
         ]
     )
-    return umap_model, clusterer, fit_df
+    return umap_model, clusterer, fit_df, fit_coords
 
 
 def transform_embeddings_to_analysis(
@@ -1339,7 +1339,7 @@ def main() -> int:
 
     fit_start = perf_counter()
     log("Fitting UMAP and HDBSCAN on the latent fit sample")
-    umap_model, clusterer, fit_df = fit_umap_and_hdbscan(
+    umap_model, clusterer, fit_df, fit_coords = fit_umap_and_hdbscan(
         fit_sample_path=umap_fit_path,
         n_neighbors=args.umap_n_neighbors,
         min_dist=args.umap_min_dist,
@@ -1360,6 +1360,7 @@ def main() -> int:
         umap_model=umap_model,
         clusterer=clusterer,
         fit_df=fit_df,
+        umap_latent_columns = fit_coords
     )
     log(f"Saved predictor state to {predictor_state_dir}")
     fit_assignment_df = fit_df.select(["row_index", "cluster_label", "cluster_probability"]).sort("row_index")

@@ -209,7 +209,11 @@ class LatentInference:
                         )
                     ]
                     if selected_id_columns:
-                        output_frames.append(frame.select(selected_id_columns))
+                        available_id_columns = [
+                            column for column in selected_id_columns if column in frame.columns
+                        ]
+                        if available_id_columns:
+                            output_frames.append(frame.select(available_id_columns))
                     output_frames.append(
                         pl.DataFrame(
                             {

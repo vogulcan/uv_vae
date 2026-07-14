@@ -88,6 +88,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=12)
     return parser.parse_args()
 
+def prompt_continue_after_training(run_dir: Path) -> bool:
+    """Ask the user whether to continue past the training stage.
+ 
+    Returns True to continue (build/print summary), False to stop the
+    entire process here. Always prompts interactively, including under
+    SLURM, since srun/salloc allocations still attach a TTY when run
+    with --pty (or an interactive terminal is attached to the job).
+    """
+    response = input(
+        f"Training complete. model.pt saved to {run_dir / 'model.pt'}. "
+        "Stop here? [y/N]: "
+    ).strip().lower()
+    return response not in ("y", "yes")
 
 def resolve_requested_sample_rows(args: argparse.Namespace) -> int | None:
     if args.use_all:
@@ -170,6 +183,10 @@ def main() -> int:
     log("Launching VAE training")
     run_dir = train(config)
     log(f"Training finished in {format_seconds(perf_counter() - train_start)}")
+
+    if not prompt_continue_after_training(run_dir):
+        log("Stopping pipeline after training as requested.")
+        sys.exit(0)
 
     summary_path = run_dir / "summary.json"
     summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}

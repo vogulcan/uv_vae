@@ -16,3 +16,15 @@ data/
 # Training outputs
 artifacts/
 
+# sweep results
+sweep_results/
+
+# claude code
+.claude/
+
+# pytest
+.pytest_cache/
+
+# tests
+tests/
+
