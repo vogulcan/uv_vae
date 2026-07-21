@@ -35,11 +35,10 @@ ROW_FILTER="${ROW_FILTER:-st = 'MIXED' AND et = 'MIXED' AND FILT = 1}"
 THREADS="${SLURM_CPUS_PER_TASK:-32}"
 SEED="${SEED:-42}"
 
-# Training rows per VAE. Small for fast iteration; the 2.5M-5M sweet spot is the
-# lowest-variance-per-compute point, NOT full-data quality. For the final call use
-# ALL_ROWS=1 to train on every filtered row (best absolute fidelity).
-SAMPLE_ROWS="${SAMPLE_ROWS:-200000}"      # ignored when ALL_ROWS=1
-ALL_ROWS="${ALL_ROWS:-0}"                 # 1 => use every filtered row, no subsampling
+# Always train on every filtered row (no reservoir subsampling).
+# Set ALL_ROWS=0 to fall back to SAMPLE_ROWS for fast iteration.
+ALL_ROWS="${ALL_ROWS:-1}"                 # default: all filtered rows
+SAMPLE_ROWS="${SAMPLE_ROWS:-200000}"      # only used when ALL_ROWS=0
 REFERENCE_ROWS="${REFERENCE_ROWS:-4000}"  # fixed rows every model encodes for the metrics
 
 # The five requested selection methods (all scikit-learn except permutation,
