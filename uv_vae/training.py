@@ -39,6 +39,7 @@ class TrainingConfig:
     train_fraction: float
     seed: int
     threads: int | None
+    data_seed: int | None = None
 
 
 def seed_everything(seed: int) -> None:
@@ -178,13 +179,14 @@ def train(config: TrainingConfig) -> Path:
         )
 
     # DuckDB's REPEATABLE sampling is only deterministic with a single thread.
+    sampling_seed = config.data_seed if config.data_seed is not None else config.seed
     with connect_duckdb(threads=1) as sample_conn:
         sampled_frame = sample_frame(
             conn=sample_conn,
             parquet_path=config.parquet_path,
             feature_names=feature_names,
             sample_rows=sample_rows,
-            seed=config.seed,
+            seed=sampling_seed,
             where=config.row_filter,
         )
 

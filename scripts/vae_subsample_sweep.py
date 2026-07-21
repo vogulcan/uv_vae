@@ -197,7 +197,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--kl-weight", type=float, default=0.05)
     parser.add_argument("--train-fraction", type=float, default=0.9)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Training seed (weight init, train/val split, batch order)")
+    parser.add_argument("--data-seed", type=int, default=None,
+                        help="Separate seed for DuckDB row sampling only. "
+                             "When set, --seed controls all training RNG while this "
+                             "controls which rows are selected. Omit to use --seed for both.")
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--feature-spec-path", default="ml_features.json")
     parser.add_argument(
@@ -255,6 +260,7 @@ def run_sweep(args: argparse.Namespace) -> list[dict]:
             train_fraction=args.train_fraction,
             seed=args.seed,
             threads=args.threads,
+            data_seed=args.data_seed,
         )
 
         t0 = perf_counter()
