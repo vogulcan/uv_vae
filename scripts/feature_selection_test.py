@@ -140,7 +140,13 @@ import torch
 from scipy.spatial import procrustes
 from torch.utils.data import DataLoader, TensorDataset
 
-from uv_vae.data import connect_duckdb, get_non_null_counts, get_row_count, sample_frame
+from uv_vae.data import (
+    connect_duckdb,
+    get_non_null_counts,
+    get_row_count,
+    quote_ident,
+    sample_frame,
+)
 from uv_vae.early_stopping import (
     DEFAULT_ACTIVE_UNIT_THRESHOLD,
     EarlyStoppingConfig,
@@ -911,7 +917,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--row-filter", default=DEFAULT_TRAINING_ROW_FILTER)
 
     parser.add_argument("--sample-rows", type=int, default=DEFAULT_SAMPLE_ROWS,
-                        help="Training rows (kept small for fast iteration).")
+                        help="Training rows (kept small for fast iteration). "
+                             "Set to 0 (or use --all-rows) to train on every filtered row.")
+    parser.add_argument("--all-rows", action="store_true",
+                        help="Use ALL filtered rows for training (ignores --sample-rows). "
+                             "Reads the full parquet/glob with no reservoir subsampling.")
     parser.add_argument("--reference-rows", type=int, default=DEFAULT_REFERENCE_ROWS,
                         help="Fixed rows encoded by every model for the fidelity metrics.")
     parser.add_argument("--reference-parquet-path", default=None,
@@ -969,24 +979,43 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def read_all_rows(
+    conn,
+    parquet_path: str,
+    feature_names: list[str],
+    where: str | None,
+) -> pl.DataFrame:
+    """Full read of every filtered row (no reservoir subsampling). Globs across a multi-file union."""
+    select_list = ", ".join(quote_ident(name) for name in feature_names)
+    sql = f"SELECT {select_list} FROM read_parquet(?)"
+    if where:
+        sql += f" WHERE {where}"
+    return conn.execute(sql, [str(parquet_path)]).pl()
+
+
 def load_frames(args: argparse.Namespace, feature_names: list[str]) -> tuple[pl.DataFrame, pl.DataFrame, dict[str, int]]:
     with connect_duckdb(threads=args.threads) as conn:
         eligible = get_row_count(conn, args.parquet_path, where=args.row_filter)
         non_null_counts = get_non_null_counts(conn, args.parquet_path, feature_names, where=args.row_filter)
     if eligible <= 0:
         raise RuntimeError(f"No rows matched the filter: {args.row_filter}")
-    sample_rows = min(args.sample_rows, eligible)
-    log(f"Eligible rows={eligible:,}; sampling train={sample_rows:,}, reference={args.reference_rows:,}")
+    use_all_rows = args.all_rows or args.sample_rows <= 0
+    sample_rows = eligible if use_all_rows else min(args.sample_rows, eligible)
+    how = "ALL filtered rows" if use_all_rows else f"reservoir sample of {sample_rows:,}"
+    log(f"Eligible rows={eligible:,}; training on {how}; reference={args.reference_rows:,}")
 
     with connect_duckdb(threads=1) as conn:  # threads=1 -> deterministic REPEATABLE sampling
-        train_frame = sample_frame(
-            conn=conn,
-            parquet_path=args.parquet_path,
-            feature_names=feature_names,
-            sample_rows=sample_rows,
-            seed=args.seed,
-            where=args.row_filter,
-        )
+        if use_all_rows:
+            train_frame = read_all_rows(conn, args.parquet_path, feature_names, where=args.row_filter)
+        else:
+            train_frame = sample_frame(
+                conn=conn,
+                parquet_path=args.parquet_path,
+                feature_names=feature_names,
+                sample_rows=sample_rows,
+                seed=args.seed,
+                where=args.row_filter,
+            )
     reference_source = args.reference_parquet_path or args.parquet_path
     with connect_duckdb(threads=1) as conn:
         reference_frame = sample_frame(

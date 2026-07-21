@@ -35,8 +35,11 @@ ROW_FILTER="${ROW_FILTER:-st = 'MIXED' AND et = 'MIXED' AND FILT = 1}"
 THREADS="${SLURM_CPUS_PER_TASK:-32}"
 SEED="${SEED:-42}"
 
-# Fast-iteration sizes. Bump SAMPLE_ROWS toward the 2.5M-5M sweet spot for a final call.
-SAMPLE_ROWS="${SAMPLE_ROWS:-200000}"      # training rows per VAE
+# Training rows per VAE. Small for fast iteration; the 2.5M-5M sweet spot is the
+# lowest-variance-per-compute point, NOT full-data quality. For the final call use
+# ALL_ROWS=1 to train on every filtered row (best absolute fidelity).
+SAMPLE_ROWS="${SAMPLE_ROWS:-200000}"      # ignored when ALL_ROWS=1
+ALL_ROWS="${ALL_ROWS:-0}"                 # 1 => use every filtered row, no subsampling
 REFERENCE_ROWS="${REFERENCE_ROWS:-4000}"  # fixed rows every model encodes for the metrics
 
 # The five requested selection methods (all scikit-learn except permutation,
@@ -93,6 +96,7 @@ python scripts/feature_selection_test.py \
     --output-dir "$RUN_ROOT" \
     --row-filter "$ROW_FILTER" \
     --sample-rows "$SAMPLE_ROWS" \
+    $([ "$ALL_ROWS" = "1" ] && echo --all-rows) \
     --reference-rows "$REFERENCE_ROWS" \
     --methods "$METHODS" \
     --primary-method "$PRIMARY_METHOD" \
