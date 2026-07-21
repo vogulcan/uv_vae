@@ -82,14 +82,67 @@ cd "$UV_VAE_DIR"
 export PYTHONHASHSEED="$SEED"
 export CUBLAS_WORKSPACE_CONFIG=":4096:8"
 
-echo "[$(date '+%F %T')] ===== BEGIN: VAE feature selection ====="
-echo "  parquet   : $PARQUET"
-echo "  methods   : $METHODS  (primary: $PRIMARY_METHOD)"
-echo "  sizes     : keep=$KEEP_SIZES  eval-keep=$EVAL_KEEP"
-echo "  sample    : train=$SAMPLE_ROWS  reference=$REFERENCE_ROWS"
-echo "  clustering: $CLUSTERING"
-echo "  output    : $RUN_ROOT"
+###############################################################################
+# Timing + summary helpers (same convention as run_train_only.sh)
+###############################################################################
+fmt_seconds() {
+    local s=$1
+    printf '%dh %02dm %02ds' $((s / 3600)) $(((s % 3600) / 60)) $((s % 60))
+}
 
+select_seconds=0
+
+print_summary() {
+    echo ""
+    echo "=========================== TIMING SUMMARY ==========================="
+    printf '  %-24s %8ss   %s\n' "feature selection" "$select_seconds" "$(fmt_seconds "$select_seconds")"
+    printf '  %-24s %8ss   %s\n' "TOTAL"             "$SECONDS"        "$(fmt_seconds "$SECONDS")"
+    if [ -f "$RUN_ROOT/feature_selection_results.json" ]; then
+        python - "$RUN_ROOT/feature_selection_results.json" <<'PY' || true
+import json, sys
+data = json.load(open(sys.argv[1]))
+base = data.get("baseline") or {}
+rec = data.get("recommendation")
+print("  baseline features : {} (input_dim {})".format(
+    base.get("n_features", "?"), base.get("input_dim", "?")))
+if rec:
+    print("  recommended set   : {} ({}/{} features, input_dim {})".format(
+        rec.get("label", "?"), rec.get("n_features", "?"),
+        base.get("n_features", "?"), rec.get("input_dim", "?")))
+    print("  fidelity          : CKA={:.3f}  trust={:.3f}  procrustes={:.4f}".format(
+        rec.get("cka_similarity", float("nan")),
+        rec.get("trustworthiness", float("nan")),
+        rec.get("procrustes_distance", float("nan"))))
+    print("  keep              : {}".format(", ".join(rec.get("features", []))))
+else:
+    print("  recommended set   : none met the CKA/trust thresholds (see log above)")
+PY
+    fi
+    echo "  Ranking + evaluation JSON : $RUN_ROOT/feature_selection_results.json"
+    echo "  Plot                      : $RUN_ROOT/feature_selection.png"
+    echo "  Artifacts                 : $RUN_ROOT"
+    echo "  sacct -j ${SLURM_JOB_ID:-<jobid>} --format=JobID,State,Elapsed,MaxRSS"
+    echo "======================================================================"
+}
+trap print_summary EXIT
+
+echo "Run root   : $RUN_ROOT"
+echo "uv_vae dir : $UV_VAE_DIR"
+echo "Parquet    : $PARQUET"
+echo "Row filter : $ROW_FILTER"
+echo "Methods    : $METHODS  (primary: $PRIMARY_METHOD)"
+echo "Sizes      : keep=$KEEP_SIZES  eval-keep=$EVAL_KEEP"
+if [ "$ALL_ROWS" = "1" ]; then
+    echo "Rows       : ALL filtered rows  reference=$REFERENCE_ROWS"
+else
+    echo "Rows       : train=$SAMPLE_ROWS  reference=$REFERENCE_ROWS"
+fi
+echo "Clustering : $CLUSTERING"
+echo "Threads    : $THREADS"
+
+echo ""
+echo "[$(date '+%F %T')] ===== BEGIN: rank features + retrain reduced VAEs ====="
+stage_start=$SECONDS
 python scripts/feature_selection_test.py \
     --parquet-path "$PARQUET" \
     --feature-spec-path "$UV_VAE_DIR/ml_features.json" \
@@ -119,8 +172,5 @@ python scripts/feature_selection_test.py \
     --threads "$THREADS" \
     --seed "$SEED" \
     ${FORCE_KEEP:+--force-keep "$FORCE_KEEP"}
-
-echo "[$(date '+%F %T')] ===== END: feature selection ($SECONDS s) ====="
-echo "  Ranking + evaluation JSON : $RUN_ROOT/feature_selection_results.json"
-echo "  Plot                      : $RUN_ROOT/feature_selection.png"
-echo "  (The recommended minimal feature set is printed at the end of the log above.)"
+select_seconds=$((SECONDS - stage_start))
+echo "[$(date '+%F %T')] ===== END: feature selection ($(fmt_seconds "$select_seconds")) ====="
