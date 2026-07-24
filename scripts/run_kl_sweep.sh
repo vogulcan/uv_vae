@@ -68,6 +68,9 @@ CLUSTER="${CLUSTER:-0}"
 # Clustering pipeline settings (only used when CLUSTER=1).
 DUCKDB_MEM="${DUCKDB_MEM:-8GB}"
 UMAP_FIT_ROWS="${UMAP_FIT_ROWS:-100000}"
+UMAP_N_NEIGHBORS="${UMAP_N_NEIGHBORS:-30}"
+UMAP_MIN_DIST="${UMAP_MIN_DIST:-0.05}"
+UMAP_METRIC="${UMAP_METRIC:-euclidean}"
 HDBSCAN_MIN_CLUSTER_SIZE="${HDBSCAN_MIN_CLUSTER_SIZE:-250}"
 HDBSCAN_MIN_SAMPLES="${HDBSCAN_MIN_SAMPLES:-25}"
 
@@ -206,6 +209,9 @@ print(json.load(open(sys.argv[1]))['checkpoint_path'])
             --output-root "$kl_dir/clustering" \
             --use-all \
             --umap-fit-rows "$UMAP_FIT_ROWS" \
+            --umap-n-neighbors "$UMAP_N_NEIGHBORS" \
+            --umap-min-dist "$UMAP_MIN_DIST" \
+            --umap-metric "$UMAP_METRIC" \
             --hdbscan-min-cluster-size "$HDBSCAN_MIN_CLUSTER_SIZE" \
             --hdbscan-min-samples "$HDBSCAN_MIN_SAMPLES" \
             --seed "$SEED" \
