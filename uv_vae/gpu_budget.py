@@ -10,6 +10,12 @@ run is allowed to expand into the whole card. ``apply()`` installs a ceiling
   this, cuDF's default pool grows toward all free memory and the torch ceiling
   buys nothing.
 
+The two allocators **share one budget**: RMM is capped first, and torch is given
+whatever is left. They must not each be handed the full ceiling -- that was a bug
+in the first version of this module, where a 16 GB budget permitted 16 GB of torch
+plus an 8 GB RMM pool, i.e. 24 GB. ``budget_gb`` is the total for the process, and
+``BudgetReport.torch_budget_gb + BudgetReport.rmm_pool_gb`` must equal it.
+
 Both caps are per *process*. When several runs share the card, divide the budget
 between them (the tmux runners do this from ``concurrency``).
 
@@ -27,7 +33,18 @@ from dataclasses import dataclass, field
 
 BUDGET_ENV = "UV_VAE_GPU_MEM_GB"
 POLICY_ENV = "UV_VAE_GPU_OOM_POLICY"
+RMM_SHARE_ENV = "UV_VAE_RMM_SHARE"
 DEFAULT_BUDGET_GB = 16.0
+
+# Slice of the budget reserved for RMM (cuDF / cuML); torch gets the rest.
+#
+# 0.25 suits the TRAINING path, which is what the sweeps run: cuDF only holds one
+# decoded record batch (read_chunk_rows, default 100k) at a time, while torch holds
+# the model, a full batch of activations and the optimizer state -- so torch is by
+# far the heavier consumer. The clustering pipeline inverts this (cuML UMAP/HDBSCAN
+# over millions of rows against torch doing single-batch inference), so it should
+# pass a larger share explicitly, or set UV_VAE_RMM_SHARE.
+DEFAULT_RMM_SHARE = 0.25
 
 # Fraction of the budget a training batch may occupy. The rest absorbs
 # fragmentation, cuBLAS workspaces, the CUDA context (~0.5 GB) and optimizer state.
@@ -48,7 +65,10 @@ class BudgetReport:
     budget_gb: float
     device_total_gb: float | None = None
     torch_fraction: float | None = None
-    rmm_pool_gb: float | None = None
+    # torch_budget_gb + rmm_pool_gb == budget_gb. Recorded separately so a run's
+    # training_report.json shows how the one budget was divided.
+    torch_budget_gb: float | None = None
+    rmm_pool_gb: float = 0.0
     notes: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -57,6 +77,7 @@ class BudgetReport:
             "budget_gb": self.budget_gb,
             "device_total_gb": self.device_total_gb,
             "torch_fraction": self.torch_fraction,
+            "torch_budget_gb": self.torch_budget_gb,
             "rmm_pool_gb": self.rmm_pool_gb,
             "notes": list(self.notes),
         }
@@ -76,8 +97,41 @@ def resolve_budget_gb(budget_gb: float | None = None) -> float:
     return value if value > 0 else DEFAULT_BUDGET_GB
 
 
-def apply(budget_gb: float | None = None, verbose: bool = True) -> BudgetReport:
-    """Cap torch (and RMM, if present) at ``budget_gb`` on the current device.
+def resolve_rmm_share(rmm_share: float | None = None) -> float:
+    """Slice of the budget RMM may take -- 0.0 when RMM is not even installed.
+
+    Both ``apply`` and ``max_batch_rows`` call this so they agree on how much of
+    the budget is left for torch. Without RMM present the answer is 0.0 and torch
+    gets the whole budget.
+    """
+    try:
+        import rmm  # noqa: F401
+    except ImportError:
+        return 0.0
+
+    if rmm_share is None:
+        raw = os.environ.get(RMM_SHARE_ENV, "").strip()
+        try:
+            rmm_share = float(raw) if raw else DEFAULT_RMM_SHARE
+        except ValueError:
+            rmm_share = DEFAULT_RMM_SHARE
+    # Never starve torch entirely, and never go negative.
+    return min(max(float(rmm_share), 0.0), 0.9)
+
+
+def torch_budget_gb(budget_gb: float | None = None, rmm_share: float | None = None) -> float:
+    """The part of the budget torch actually gets, after RMM's slice."""
+    budget = resolve_budget_gb(budget_gb)
+    return budget * (1.0 - resolve_rmm_share(rmm_share))
+
+
+def apply(budget_gb: float | None = None, rmm_share: float | None = None,
+          verbose: bool = True) -> BudgetReport:
+    """Cap torch and RMM so their COMBINED footprint stays within ``budget_gb``.
+
+    RMM is capped first and torch is given the remainder. Handing each allocator
+    the full budget would permit 1.5-2x the intended footprint, which is the whole
+    thing this function exists to prevent.
 
     Safe to call more than once and safe to call with no GPU -- it reports
     ``enabled=False`` and changes nothing.
@@ -106,33 +160,39 @@ def apply(budget_gb: float | None = None, verbose: bool = True) -> BudgetReport:
         )
         budget_bytes = float(total_bytes)
 
-    fraction = budget_bytes / total_bytes
+    # RMM first: torch's share is whatever RMM did not reserve, and RMM must be
+    # bounded before cuDF/cuML allocate anything from it.
+    rmm_bytes = _cap_rmm(budget_bytes, resolve_rmm_share(rmm_share), report)
+
+    torch_bytes = budget_bytes - rmm_bytes
+    fraction = torch_bytes / total_bytes
     torch.cuda.set_per_process_memory_fraction(fraction, 0)
     report.torch_fraction = round(fraction, 4)
+    report.torch_budget_gb = round(torch_bytes / BYTES_PER_GB, 2)
     report.enabled = True
 
-    _cap_rmm(budget_bytes, report)
     return _finish(report, verbose)
 
 
-def _cap_rmm(budget_bytes: float, report: BudgetReport) -> None:
-    """Bound the RMM pool that cuDF/cuML allocate from.
+def _cap_rmm(budget_bytes: float, share: float, report: BudgetReport) -> int:
+    """Bound the RMM pool that cuDF/cuML allocate from; return the bytes reserved.
 
-    Skipped silently when RMM is absent (the CPU-only and torch-only paths). The
-    pool is deliberately smaller than the torch ceiling: both allocators draw on
-    the same device, so they have to share one budget rather than each claim it.
+    Returns 0 when RMM is absent (the CPU-only and torch-only paths) or when the
+    reinitialisation fails -- in both cases the caller gives torch the whole
+    budget, which is correct because nothing else will be allocating.
     """
+    if share <= 0.0:
+        report.notes.append("rmm not installed or share=0; whole budget goes to torch")
+        return 0
+
     try:
         import rmm
-    except ImportError:
+    except ImportError:  # resolve_rmm_share already checked, but stay defensive
         report.notes.append("rmm not installed; cuDF/cuML pool not capped")
-        return
+        return 0
 
-    # Half the budget to RMM, half left for torch. cuDF only holds one decoded
-    # record batch at a time, so it is the lighter of the two consumers.
-    pool_bytes = int(budget_bytes * 0.5)
-    # RMM requires pool sizes aligned to 256 bytes.
-    pool_bytes -= pool_bytes % 256
+    pool_bytes = int(budget_bytes * share)
+    pool_bytes -= pool_bytes % 256  # RMM requires 256-byte aligned pool sizes
     try:
         rmm.reinitialize(
             pool_allocator=True,
@@ -142,8 +202,10 @@ def _cap_rmm(budget_bytes: float, report: BudgetReport) -> None:
         report.rmm_pool_gb = round(pool_bytes / BYTES_PER_GB, 2)
         # Let cuDF spill to host RAM rather than fail when the pool is exhausted.
         os.environ.setdefault("CUDF_SPILL", "1")
+        return pool_bytes
     except Exception as exc:  # RMM raises a variety of driver-level errors
         report.notes.append(f"rmm.reinitialize failed ({type(exc).__name__}: {exc})")
+        return 0
 
 
 def _finish(report: BudgetReport, verbose: bool) -> BudgetReport:
@@ -153,10 +215,13 @@ def _finish(report: BudgetReport, verbose: bool) -> BudgetReport:
         if report.enabled:
             message = (
                 f"[gpu_budget] cap {report.budget_gb:.1f} GB of "
-                f"{report.device_total_gb} GB (torch fraction {report.torch_fraction})"
+                f"{report.device_total_gb} GB = torch {report.torch_budget_gb} GB "
+                f"(fraction {report.torch_fraction})"
             )
-            if report.rmm_pool_gb is not None:
-                message += f", rmm pool {report.rmm_pool_gb} GB"
+            message += (
+                f" + rmm pool {report.rmm_pool_gb} GB" if report.rmm_pool_gb
+                else " + rmm 0 GB (not installed)"
+            )
         else:
             message = f"[gpu_budget] not enforced: {'; '.join(report.notes) or 'no GPU'}"
         print(message, file=sys.stderr, flush=True)
@@ -205,10 +270,15 @@ def max_batch_rows(
     per_row_bytes: int,
     budget_gb: float | None = None,
     headroom: float = DEFAULT_BATCH_HEADROOM,
+    rmm_share: float | None = None,
 ) -> int:
-    """Largest batch that fits inside ``headroom`` of the budget."""
-    budget = resolve_budget_gb(budget_gb)
-    usable = budget * BYTES_PER_GB * headroom
+    """Largest batch that fits inside ``headroom`` of TORCH's share of the budget.
+
+    Measured against ``torch_budget_gb``, not the whole budget: a batch is a torch
+    allocation, and RMM's slice is not available to it. When RMM is not installed
+    the two are the same number.
+    """
+    usable = torch_budget_gb(budget_gb, rmm_share) * BYTES_PER_GB * headroom
     return max(1, int(usable // max(1, per_row_bytes)))
 
 
