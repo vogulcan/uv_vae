@@ -35,6 +35,7 @@ SAMPLE_2="/cta/users/patrickgao765/parquet_files/CHANGE_ME_sample_2.featuremap.p
 ###############################################################################
 
 UV_VAE_DIR="${UV_VAE_DIR:-$HOME/uv_vae}"
+EARLY_STOPPING_DIR="${EARLY_STOPPING_DIR:-$HOME/Early_Stopping_Tests}"
 RUN_ROOT="${RUN_ROOT:-/cta/users/patrickgao765/uv_vae/full_pipeline_${SLURM_JOB_ID:-manual}}"
 ROW_FILTER="${ROW_FILTER:-st = 'MIXED' AND et = 'MIXED' AND FILT = 1}"
 THREADS="${SLURM_CPUS_PER_TASK:-32}"
@@ -152,7 +153,7 @@ end_stage "1. combine parquets"
 # Stage 2 -- train the VAE on the FULL merged pool, ended by early stopping
 ###############################################################################
 begin_stage "2. train VAE (early stopping)"
-python scripts/train_with_early_stopping.py \
+python "$EARLY_STOPPING_DIR/Python Files/train_with_early_stopping.py" \
     --parquet-path "$COMBINED" \
     --feature-spec-path "$UV_VAE_DIR/ml_features.json" \
     --output-dir "$RUN_ROOT/training" \

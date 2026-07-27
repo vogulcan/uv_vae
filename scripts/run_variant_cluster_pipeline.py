@@ -1,18 +1,51 @@
-import cuml.accel 
-cuml.accel.install() 
-from cuml.common import logger 
-logger.set_level(logger.level_enum.debug)
-
 from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+os.environ.setdefault("NUMBA_CACHE_DIR", str((REPO_ROOT / ".numba_cache").resolve()))
+
+# cuML gives zero-code-change GPU acceleration for UMAP / HDBSCAN / sklearn, but it
+# needs a GPU. Activate it *before* those libraries are imported (so it can patch
+# them), and only when CUDA is actually present -- fall back to CPU cleanly on a
+# GPU-less machine, or if cuml isn't installed yet.
+#
+# Two guards, both of which matter now that the node has a GPU:
+#
+# * UV_VAE_DISABLE_CUML=1 keeps this module importable WITHOUT patching anything.
+#   Other scripts import it only to reuse the SigProfiler helpers, and they import
+#   it lazily -- mid-run, after their own CPU hdbscan has already fitted. Patching
+#   the clustering stack at that point silently changes which estimator later
+#   variants use, and cuML's HDBSCAN exposes no ``relative_validity_``, so DBCV
+#   quietly becomes None.
+# * The memory ceiling is installed BEFORE cuml loads, because cuML allocates
+#   through RMM and an uncapped RMM pool grows toward all free device memory.
+if torch.cuda.is_available() and os.environ.get("UV_VAE_DISABLE_CUML", "").strip() not in {"1", "true", "yes"}:
+    try:
+        from uv_vae import gpu_budget
+
+        gpu_budget.apply()
+
+        import cuml.accel
+
+        cuml.accel.install()
+        from cuml.common import logger
+
+        logger.set_level(logger.level_enum.debug)
+    except ImportError:
+        pass
 
 import argparse
 import colorsys
 import json
-import os
 import pickle
-import sys
 from datetime import UTC, datetime
-from pathlib import Path
 from time import perf_counter
 from typing import Callable
 
@@ -21,17 +54,11 @@ import matplotlib
 import numpy as np
 import polars as pl
 import pyarrow.parquet as pq
-import torch
 from matplotlib import pyplot as plt
 from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
 from PIL import Image, ImageDraw, ImageOps
 from SigProfilerAssignment import Analyzer
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-os.environ.setdefault("NUMBA_CACHE_DIR", str((REPO_ROOT / ".numba_cache").resolve()))
 
 from umap import UMAP
 

@@ -40,10 +40,21 @@ def resolve_existing_path(path_str: str, checkpoint_path: Path) -> Path:
 
 def resolve_device(device: str | None) -> torch.device:
     if device is None or device == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device == "cuda" and not torch.cuda.is_available():
+        resolved = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested for inference but is not available")
-    return torch.device(device)
+    else:
+        resolved = torch.device(device)
+
+    # Every inference entry point funnels through here, so this is the one place
+    # that has to install the GPU ceiling. Encoding only holds one batch on the
+    # device at a time, but the cap also bounds anything cuDF/cuML allocate in the
+    # same process (the clustering pipeline imports both).
+    if resolved.type == "cuda":
+        from uv_vae import gpu_budget
+
+        gpu_budget.apply()
+    return resolved
 
 
 def unique_columns(columns: list[str]) -> list[str]:

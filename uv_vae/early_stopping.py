@@ -46,6 +46,12 @@ from uv_vae.training import (
 
 DEFAULT_ACTIVE_UNIT_THRESHOLD = 0.01
 
+# Per-dimension KL below which a latent dim counts as collapsed (Lucas et al. 2019,
+# "Don't Blame the ELBO!", arXiv 1911.02469). Defined here rather than in
+# `latent_metrics` so the training path can use it without importing sklearn;
+# `latent_metrics` re-exports it so post-hoc and per-epoch numbers stay comparable.
+DEFAULT_KL_COLLAPSE_THRESHOLD = 0.1
+
 
 @dataclass(frozen=True)
 class EarlyStoppingConfig:
@@ -53,11 +59,15 @@ class EarlyStoppingConfig:
 
     patience <= 0 disables early stopping entirely, in which case this trainer still
     records all the diagnostics but runs the full `epochs` budget.
+
+    `kl_collapse_threshold` only affects reported diagnostics — it never influences the
+    stopping decision, which stays ELBO + active units.
     """
 
     patience: int = 0
     min_delta: float = 1e-3
     active_unit_threshold: float = DEFAULT_ACTIVE_UNIT_THRESHOLD
+    kl_collapse_threshold: float = DEFAULT_KL_COLLAPSE_THRESHOLD
 
     @property
     def enabled(self) -> bool:
@@ -69,6 +79,7 @@ def compute_latent_diagnostics(
     loader: DataLoader,
     device: torch.device,
     active_unit_threshold: float = DEFAULT_ACTIVE_UNIT_THRESHOLD,
+    kl_collapse_threshold: float = DEFAULT_KL_COLLAPSE_THRESHOLD,
 ) -> dict[str, object]:
     """Per-dimension latent statistics over a full pass of `loader`.
 
@@ -108,14 +119,27 @@ def compute_latent_diagnostics(
     kl_per_dim = kl_sum / count
     active_mask = mu_variance > active_unit_threshold
 
+    kl_per_dim_list = kl_per_dim.cpu()
+    kl_total = float(kl_per_dim_list.sum().item())
+
+    # Collapse diagnostics, tracked per epoch so a dimension going quiet is visible while
+    # it happens rather than only in the post-hoc `latent_metrics` report.
+    mean_kl = kl_total / latent_dim if latent_dim > 0 else 0.0
+    collapsed_dims = int((kl_per_dim_list < kl_collapse_threshold).sum().item())
+    collapsed_pct = (collapsed_dims / latent_dim * 100.0) if latent_dim > 0 else 0.0
+
     return {
         "active_units": int(active_mask.sum().item()),
         "latent_dim": latent_dim,
         "active_unit_threshold": float(active_unit_threshold),
         "active_unit_mask": [bool(value) for value in active_mask.cpu().tolist()],
         "posterior_mean_variance": [float(value) for value in mu_variance.cpu().tolist()],
-        "kl_per_dim": [float(value) for value in kl_per_dim.cpu().tolist()],
-        "kl_total": float(kl_per_dim.sum().item()),
+        "kl_per_dim": [float(value) for value in kl_per_dim_list.tolist()],
+        "kl_total": kl_total,
+        "mean_kl": mean_kl,
+        "kl_collapse_threshold": float(kl_collapse_threshold),
+        "collapsed_dims": collapsed_dims,
+        "collapsed_pct": collapsed_pct,
         "rows_evaluated": count,
     }
 
@@ -282,6 +306,7 @@ def train_with_early_stopping(
             loader=val_loader,
             device=device,
             active_unit_threshold=early_stopping.active_unit_threshold,
+            kl_collapse_threshold=early_stopping.kl_collapse_threshold,
         )
 
         val_loss = val_metrics["total_loss"]
@@ -299,6 +324,9 @@ def train_with_early_stopping(
             "val_kl_loss": val_metrics["kl_loss"],
             "active_units": active_units,
             "kl_total": float(diagnostics["kl_total"]),
+            "mean_kl": float(diagnostics["mean_kl"]),
+            "collapsed_dims": int(diagnostics["collapsed_dims"]),
+            "collapsed_pct": float(diagnostics["collapsed_pct"]),
         }
         history.append(epoch_metrics)
         diagnostics_history.append({"epoch": epoch, **diagnostics})
@@ -373,6 +401,7 @@ def train_with_early_stopping(
     }
     diagnostics_report = {
         "active_unit_threshold": early_stopping.active_unit_threshold,
+        "kl_collapse_threshold": early_stopping.kl_collapse_threshold,
         "latent_dim": config.latent_dim,
         "early_stopping": early_stopping_report,
         "per_epoch": diagnostics_history,

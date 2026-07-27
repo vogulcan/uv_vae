@@ -5,8 +5,11 @@ regardless of dataset size.  Preprocessing (categorical encoding, numeric
 normalisation) is applied per-chunk as data flows through.
 
 Train/val split is deterministic: row *i* in the stream goes to validation when
-``i % val_denominator == seed % val_denominator``, otherwise to training.  Parquet
-row order is stable, so this is reproducible across runs with the same seed.
+``i % val_denominator == seed % val_denominator``, otherwise to training.  The
+split is therefore a property of a row's POSITION in the scan, not of its
+contents, and the train and val datasets each run their own scan — so both scans
+must return rows in the same order.  ``connect_duckdb(preserve_insertion_order=True)``
+pins that; do not relax it without moving the split onto a content hash first.
 
 Shuffling is done within fixed-size windows (default 500 000 rows) — large enough
 to break any correlation from the parquet's physical layout (e.g. samples
@@ -38,11 +41,13 @@ from uv_vae.data import (
     stream_parquet_batches,
 )
 from uv_vae.early_stopping import (
+    DEFAULT_KL_COLLAPSE_THRESHOLD,
     EarlyStoppingConfig,
     EarlyStoppingMonitor,
 )
 from uv_vae.features import FeatureSpec, load_feature_specs
 from uv_vae.model import TabularVAE, VAEConfig
+from uv_vae import gpu_budget
 from uv_vae.preprocess import encode_categorical_column, encode_numeric_column, infer_embedding_dim
 from uv_vae.training import (
     TrainingConfig,
@@ -301,7 +306,12 @@ class StreamingParquetDataset(IterableDataset):
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed + self._epoch)
-        conn = connect_duckdb(threads=self.threads)
+        # preserve_insertion_order is pinned, not assumed: _split_mask assigns
+        # train/val by position in this scan, and the train and val datasets scan
+        # through separate connections. If the two scans disagreed on row order a
+        # row could land in both splits, and the val loss driving early stopping
+        # would be measured on rows the model trained on.
+        conn = connect_duckdb(threads=self.threads, preserve_insertion_order=True)
         try:
             reader = stream_parquet_batches(
                 conn=conn,
@@ -414,11 +424,14 @@ def _run_training_epoch(
     kl_weight: float,
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
-) -> dict[str, float]:
-    """One training epoch with optional mixed-precision (AMP).
+    warmup_scheduler: torch.optim.lr_scheduler.LinearLR | None = None,
+    warmup_steps: int = 0,
+    global_step: int = 0,
+) -> tuple[dict[str, float], int]:
+    """One training epoch with optional mixed-precision (AMP) and LR warmup.
 
-    When ``scaler`` is disabled (CPU) the call path is equivalent to
-    ``training.run_epoch`` with an optimizer.
+    Returns (metrics, steps_this_epoch) so the caller can track global_step
+    for warmup scheduling.
     """
     model.train()
     use_amp = scaler.is_enabled()
@@ -429,6 +442,7 @@ def _run_training_epoch(
         "total_loss": 0.0,
     }
     num_batches = 0
+    step = global_step
 
     for cat_inputs, num_inputs, num_mask in loader:
         cat_inputs = cat_inputs.to(device, non_blocking=True)
@@ -463,6 +477,10 @@ def _run_training_epoch(
         scaler.step(optimizer)
         scaler.update()
 
+        if warmup_scheduler is not None and step < warmup_steps:
+            warmup_scheduler.step()
+        step += 1
+
         running["numeric_loss"] += float(numeric_loss.detach())
         running["categorical_loss"] += float(categorical_loss.detach())
         running["kl_loss"] += float(kl_loss.detach())
@@ -471,7 +489,7 @@ def _run_training_epoch(
 
     if num_batches == 0:
         raise RuntimeError("No batches were produced during training")
-    return {k: v / num_batches for k, v in running.items()}
+    return {k: v / num_batches for k, v in running.items()}, num_batches
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +502,7 @@ def run_val_epoch_with_diagnostics(
     device: torch.device,
     kl_weight: float,
     active_unit_threshold: float,
+    kl_collapse_threshold: float = DEFAULT_KL_COLLAPSE_THRESHOLD,
     use_amp: bool = False,
 ) -> tuple[dict[str, float], dict[str, object]]:
     """Validation loss AND latent diagnostics in a single pass through ``loader``."""
@@ -558,14 +577,27 @@ def run_val_epoch_with_diagnostics(
     kl_per_dim = kl_dim_sum / diag_count
     active_mask = mu_var > active_unit_threshold
 
+    kl_per_dim_cpu = kl_per_dim.cpu()
+    kl_total = float(kl_per_dim_cpu.sum().item())
+
+    # Collapse diagnostics, tracked per epoch so a dimension going quiet is visible while
+    # it happens rather than only in the post-hoc `latent_metrics` report.
+    mean_kl = kl_total / latent_dim if latent_dim > 0 else 0.0
+    collapsed_dims = int((kl_per_dim_cpu < kl_collapse_threshold).sum().item())
+    collapsed_pct = (collapsed_dims / latent_dim * 100.0) if latent_dim > 0 else 0.0
+
     diagnostics: dict[str, object] = {
         "active_units": int(active_mask.sum().item()),
         "latent_dim": latent_dim,
         "active_unit_threshold": float(active_unit_threshold),
         "active_unit_mask": [bool(v) for v in active_mask.cpu().tolist()],
         "posterior_mean_variance": [float(v) for v in mu_var.cpu().tolist()],
-        "kl_per_dim": [float(v) for v in kl_per_dim.cpu().tolist()],
-        "kl_total": float(kl_per_dim.sum().item()),
+        "kl_per_dim": [float(v) for v in kl_per_dim_cpu.tolist()],
+        "kl_total": kl_total,
+        "mean_kl": mean_kl,
+        "kl_collapse_threshold": float(kl_collapse_threshold),
+        "collapsed_dims": collapsed_dims,
+        "collapsed_pct": collapsed_pct,
         "rows_evaluated": diag_count,
     }
 
@@ -611,6 +643,7 @@ def train_with_early_stopping_streaming(
     hidden_dropout: float = 0.0,
     test_parquet_path: str | None = None,
     convergence_rows: int = 5000,
+    warmup_steps: int = 0,
 ) -> Path:
     """Full-dataset VAE training with streaming I/O and early stopping.
 
@@ -661,6 +694,12 @@ def train_with_early_stopping_streaming(
     if device.type == "cuda":
         torch.set_float32_matmul_precision("highest")
 
+    # ---- GPU memory ceiling ----
+    # Caps torch (and the RMM pool cuDF draws from) so one run cannot expand into
+    # the whole card. Applied before the model and the loaders allocate anything.
+    budget_report = gpu_budget.apply()
+    gpu_environment = gpu_budget.describe_environment()
+
     # ---- model (with dropout when requested) ----
     model = _build_model(
         stats.categorical_specs,
@@ -670,8 +709,45 @@ def train_with_early_stopping_streaming(
         input_dropout=input_dropout,
         hidden_dropout=hidden_dropout,
     ).to(device)
+
+    # Batch size is a swept variable, so the default policy only WARNS when a batch
+    # is projected to overrun the budget -- it is never silently rewritten. The cap
+    # above still turns an overrun into a clean OOM instead of a device takeover.
+    # Set UV_VAE_GPU_OOM_POLICY=clamp to shrink instead, or =error to refuse.
+    batch_size = config.batch_size
+    batch_budget_report: dict | None = None
+    if device.type == "cuda":
+        per_row = gpu_budget.bytes_per_row(
+            n_categorical=len(stats.categorical_specs),
+            n_numeric=len(stats.numeric_specs),
+            embedding_dims=model.config.embedding_dims,
+            hidden_dims=hidden_dims,
+            latent_dim=config.latent_dim,
+            categorical_cardinalities=model.config.categorical_cardinalities,
+            amp=use_amp,
+        )
+        batch_size, batch_budget_report = gpu_budget.resolve_batch_size(
+            config.batch_size, per_row
+        )
+        if batch_budget_report["action"] != "kept":
+            print(
+                f"[gpu_budget] batch_size {config.batch_size:,} projects to "
+                f"{batch_budget_report['projected_batch_gb']} GB; budget allows "
+                f"{batch_budget_report['max_batch_rows']:,} rows "
+                f"(policy={batch_budget_report['policy']}, "
+                f"action={batch_budget_report['action']})",
+                file=sys.stderr,
+                flush=True,
+            )
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     scaler = torch.amp.GradScaler(device="cuda", enabled=use_amp)
+    if warmup_steps > 0:
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps
+        )
+    else:
+        warmup_scheduler = None
+    global_step = 0
 
     # ---- streaming data loaders ----
     common_ds_kwargs = dict(
@@ -681,7 +757,7 @@ def train_with_early_stopping_streaming(
         numeric_means=stats.numeric_means,
         numeric_stds=stats.numeric_stds,
         row_filter=config.row_filter,
-        batch_size=config.batch_size,
+        batch_size=batch_size,
         train_fraction=config.train_fraction,
         seed=config.seed,
         threads=config.threads,
@@ -720,15 +796,16 @@ def train_with_early_stopping_streaming(
     best_state: dict[str, torch.Tensor] | None = None
 
     est_train_rows = int(total_rows * config.train_fraction)
-    est_batches = est_train_rows // config.batch_size
+    est_batches = est_train_rows // max(1, batch_size)
     dropout_desc = ""
     if input_dropout > 0 or hidden_dropout > 0:
         dropout_desc = f", dropout=({input_dropout}/{hidden_dropout})"
+    warmup_desc = f", warmup={warmup_steps}steps" if warmup_steps > 0 else ""
     print(
         f"Streaming training: ~{est_train_rows:,} train rows, "
         f"~{total_rows - est_train_rows:,} val rows, "
         f"~{est_batches:,} batches/epoch, device={device}, "
-        f"amp={use_amp}, cudf={train_dataset._use_cudf}{dropout_desc}",
+        f"amp={use_amp}, cudf={train_dataset._use_cudf}{dropout_desc}{warmup_desc}",
         file=sys.stderr,
         flush=True,
     )
@@ -737,20 +814,25 @@ def train_with_early_stopping_streaming(
     for epoch in progress:
         train_dataset.set_epoch(epoch)
 
-        train_metrics = _run_training_epoch(
+        train_metrics, steps_this_epoch = _run_training_epoch(
             model=model,
             loader=train_loader,
             device=device,
             kl_weight=config.kl_weight,
             optimizer=optimizer,
             scaler=scaler,
+            warmup_scheduler=warmup_scheduler,
+            warmup_steps=warmup_steps,
+            global_step=global_step,
         )
+        global_step += steps_this_epoch
         val_metrics, diagnostics = run_val_epoch_with_diagnostics(
             model=model,
             loader=val_loader,
             device=device,
             kl_weight=config.kl_weight,
             active_unit_threshold=early_stopping.active_unit_threshold,
+            kl_collapse_threshold=early_stopping.kl_collapse_threshold,
             use_amp=use_amp,
         )
 
@@ -775,6 +857,9 @@ def train_with_early_stopping_streaming(
             "val_kl_loss": val_metrics["kl_loss"],
             "active_units": active_units,
             "kl_total": float(diagnostics["kl_total"]),
+            "mean_kl": float(diagnostics["mean_kl"]),
+            "collapsed_dims": int(diagnostics["collapsed_dims"]),
+            "collapsed_pct": float(diagnostics["collapsed_pct"]),
         }
         if convergence_metrics and "procrustes_distance" in convergence_metrics:
             epoch_metrics["procrustes_distance"] = convergence_metrics["procrustes_distance"]
@@ -860,9 +945,16 @@ def train_with_early_stopping_streaming(
         "input_dropout": input_dropout,
         "hidden_dropout": hidden_dropout,
         "amp": use_amp,
+        # The batch size actually used can differ from config.batch_size when
+        # UV_VAE_GPU_OOM_POLICY=clamp, so record both.
+        "effective_batch_size": batch_size,
+        "gpu_budget": budget_report.as_dict(),
+        "gpu_batch_budget": batch_budget_report,
+        "gpu_environment": gpu_environment,
     }
     diagnostics_report = {
         "active_unit_threshold": early_stopping.active_unit_threshold,
+        "kl_collapse_threshold": early_stopping.kl_collapse_threshold,
         "latent_dim": config.latent_dim,
         "early_stopping": early_stopping_report,
         "per_epoch": diagnostics_history,
@@ -907,6 +999,8 @@ def train_with_early_stopping_streaming(
         "final_epoch": history[-1] if history else {},
         "streaming": True,
         "convergence_tracking": convergence_tracker is not None,
+        "effective_batch_size": batch_size,
+        "gpu_budget_gb": budget_report.budget_gb if budget_report.enabled else None,
     }
     write_json(run_dir / "summary.json", summary)
     return run_dir

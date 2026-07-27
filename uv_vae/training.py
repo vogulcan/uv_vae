@@ -203,6 +203,14 @@ def train(config: TrainingConfig) -> Path:
     if device.type == "cuda":
         torch.set_float32_matmul_precision("highest")
 
+    # Cap GPU memory before anything allocates. Tensors stay in host RAM here
+    # (TensorDataset) and only a batch at a time crosses to the device, so this
+    # path is light -- but the cap still stops a large --batch-size from expanding
+    # into a card that other work is sharing.
+    from uv_vae import gpu_budget  # local import: keeps torch-free imports of this module cheap
+
+    budget_report = gpu_budget.apply()
+
     train_loader = DataLoader(
         TensorDataset(prepared.train_cat, prepared.train_num, prepared.train_mask),
         batch_size=config.batch_size,
@@ -277,6 +285,8 @@ def train(config: TrainingConfig) -> Path:
         "cuda_available": torch.cuda.is_available(),
         "config": asdict(config),
         "history": history,
+        "gpu_budget": budget_report.as_dict(),
+        "gpu_environment": gpu_budget.describe_environment(),
     }
 
     write_json(run_dir / "feature_report.json", feature_report)

@@ -22,7 +22,18 @@ def connect_duckdb(
     database: str | Path = ":memory:",
     temp_directory: str | Path | None = None,
     memory_limit: str | None = None,
+    preserve_insertion_order: bool | None = None,
 ) -> duckdb.DuckDBPyConnection:
+    """Open a DuckDB connection with the settings this project depends on.
+
+    ``preserve_insertion_order`` is DuckDB's default (true) but pass it explicitly
+    from any caller whose CORRECTNESS depends on scan order rather than just its
+    reproducibility. The streaming trainer is the case that matters: it splits
+    train/val by a row's *position* in the stream, and it opens a separate
+    connection per split, so the two scans must agree on order or rows land in
+    both splits (leakage) or neither. Turning this off is a common large-scan
+    memory optimisation, which is exactly why it is pinned rather than assumed.
+    """
     conn = duckdb.connect(database=str(database))
     if threads:
         conn.execute(f"SET threads = {int(threads)}")
@@ -32,6 +43,10 @@ def connect_duckdb(
         conn.execute(f"SET temp_directory = {_quote_sql_string(str(temp_path))}")
     if memory_limit:
         conn.execute(f"SET memory_limit = {_quote_sql_string(memory_limit)}")
+    if preserve_insertion_order is not None:
+        conn.execute(
+            f"SET preserve_insertion_order = {'true' if preserve_insertion_order else 'false'}"
+        )
     return conn
 
 
