@@ -50,8 +50,9 @@ uv run pytest tests/
 
 ## HPC environment
 
-- Cluster: `tosun.sabanciuniv.edu`, user `patrickgao765`
-- Conda env: `patrickg`
+- GPU node: `miletus.sabanciuniv.edu` — RTX PRO 5000 Blackwell (48 GB), no SLURM, tmux runners
+- Env on miletus: **micromamba `uv_vae`** (override with `MAMBA_ENV`)
+- Older CPU cluster: `tosun.sabanciuniv.edu`, user `patrickgao765`; conda env `patrickg`
 - SLURM: account=adelab, partition=genomics, qos=adelab
 - Parquet files: `/cta/users/patrickgao765/parquet_files/`
 - Test set: `/cta/users/patrickgao765/uv_vae/test_set.parquet`

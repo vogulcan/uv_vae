@@ -13,7 +13,8 @@
 #   CONCURRENCY     tasks in flight at once (default 1)
 #   GPU_TOTAL_GB    GPU ceiling for the WHOLE sweep, split across workers (16)
 #   THREADS_TOTAL   CPU threads for the whole sweep, split across workers (nproc)
-#   CONDA_ENV       conda env name; otherwise $UV_VAE_DIR/.venv is used
+#   MAMBA_ENV       micromamba env name (default 'uv_vae') -- the miletus setup
+#   CONDA_ENV       conda env name; overrides MAMBA_ENV when set
 #   FORCE           1 = re-run tasks that already have a .done marker
 #   DRY_RUN         1 = print what would run, touch nothing
 
@@ -44,21 +45,52 @@ uvv_detect_cores() {
     fi
 }
 
+# Resolution order:
+#   1. CONDA_ENV  -- explicit conda env; setting it is an unambiguous instruction
+#   2. MAMBA_ENV  -- micromamba env, default 'uv_vae'. This is the miletus path.
+#   3. $UV_VAE_DIR/.venv
+#   4. system python
+#
+# micromamba needs its OWN hook: `conda shell.bash hook` is not a micromamba
+# subcommand, and on a node with no conda binary that line expands to nothing and
+# the following `conda activate` aborts the whole runner under `set -e`. Each
+# branch is therefore guarded by `command -v` rather than assuming the manager
+# exists.
 uvv_activate_env() {
-    # .venv first: it is the environment the previous successful runs used, and
-    # the one that actually has SigProfilerAssignment. CONDA_ENV overrides.
     local root="${UV_VAE_DIR:-$HOME/uv_vae}"
+    local mamba_env="${MAMBA_ENV:-uv_vae}"
+
     if [ -n "${CONDA_ENV:-}" ]; then
-        eval "$(conda shell.bash hook)"
-        conda activate "$CONDA_ENV"
-        uvv_log "environment: conda '$CONDA_ENV' ($(command -v python))"
-    elif [ -f "$root/.venv/bin/activate" ]; then
+        if command -v conda >/dev/null 2>&1; then
+            eval "$(conda shell.bash hook)"
+            conda activate "$CONDA_ENV"
+            uvv_log "environment: conda '$CONDA_ENV' ($(command -v python))"
+            return 0
+        fi
+        uvv_log "WARNING: CONDA_ENV='$CONDA_ENV' set but no conda binary found; trying micromamba"
+    fi
+
+    if command -v micromamba >/dev/null 2>&1; then
+        # micromamba refuses to hook without a root prefix; $HOME/micromamba is its
+        # own install default, so this only fills in when the shell rc did not.
+        export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-$HOME/micromamba}"
+        eval "$(micromamba shell hook -s bash)"
+        if micromamba activate "$mamba_env" 2>/dev/null; then
+            uvv_log "environment: micromamba '$mamba_env' ($(command -v python))"
+            return 0
+        fi
+        uvv_log "WARNING: micromamba env '$mamba_env' not found; falling back"
+    fi
+
+    if [ -f "$root/.venv/bin/activate" ]; then
         # shellcheck disable=SC1091
         source "$root/.venv/bin/activate"
         uvv_log "environment: venv $root/.venv ($(command -v python))"
-    else
-        uvv_log "environment: system python ($(command -v python)) -- no .venv, no CONDA_ENV"
+        return 0
     fi
+
+    uvv_log "environment: system python ($(command -v python)) -- no CONDA_ENV, no micromamba env '$mamba_env', no .venv"
+    return 0
 }
 
 # Exported once per RUNNER process, then inherited by every task.
