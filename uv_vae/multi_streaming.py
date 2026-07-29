@@ -21,6 +21,7 @@ per-file batch draws, the split strategy and the validation plan.
 from __future__ import annotations
 
 import glob
+import os
 import sys
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -105,6 +106,39 @@ def resolve_parquet_paths(patterns: list[str]) -> list[str]:
     return unique
 
 
+def _rmm_share_for_interleaved() -> float | None:
+    """RMM's slice of the GPU budget for an interleaved run.
+
+    This trainer decodes with pyarrow + polars on the CPU.  Unlike
+    ``streaming.py``, which has an optional cuDF encode path, **nothing here
+    allocates from RMM**.  Left at the default 0.25 share, an interleaved run on a
+    node where cuDF merely happens to be installed -- miletus, for the clustering
+    pipeline -- hands a quarter of its budget to a pool it never touches, and
+    ``_cap_rmm`` really does allocate an initial quarter of that pool up front.
+    At a 16 GB budget that is 4 GB reserved and 1 GB allocated for nothing.
+
+    So the answer is normally 0.0: torch gets the whole budget.  Two cases must
+    still bound RMM, because an *unbounded* pool grows toward all free memory and
+    the torch cap then buys nothing -- the exact failure ``gpu_budget`` exists to
+    prevent:
+
+    * ``UV_VAE_ENABLE_CUML=1`` -- the CLI installs ``cuml.accel`` for a downstream
+      clustering stage in this same process, and cuML allocates through RMM.
+    * ``UV_VAE_RMM_SHARE`` set explicitly -- the operator has made a decision;
+      returning None lets :func:`gpu_budget.resolve_rmm_share` read it, so the
+      env var keeps winning as it does everywhere else.
+
+    The ``UV_VAE_ENABLE_CUML`` test is deliberately looser than the CLI's (it
+    lowercases), so an odd spelling errs toward reserving the pool rather than
+    leaving cuML unbounded.
+    """
+    if os.environ.get("UV_VAE_ENABLE_CUML", "").strip().lower() in {"1", "true", "yes"}:
+        return None
+    if os.environ.get(gpu_budget.RMM_SHARE_ENV, "").strip():
+        return None
+    return 0.0
+
+
 def train_interleaved(
     config: TrainingConfig,
     parquet_paths: list[str],
@@ -159,7 +193,7 @@ def train_interleaved(
     use_amp = device.type == "cuda"
     if device.type == "cuda":
         torch.set_float32_matmul_precision("highest")
-    budget_report = gpu_budget.apply()
+    budget_report = gpu_budget.apply(rmm_share=_rmm_share_for_interleaved())
     gpu_environment = gpu_budget.describe_environment()
 
     hidden_dims = [int(dim) for dim in config.hidden_dims]
