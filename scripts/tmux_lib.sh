@@ -36,6 +36,108 @@ uvv_log() { echo "[$(date '+%F %T')] $*"; }
 
 uvv_rule() { printf '%.0s=' {1..72}; echo; }
 
+# ── Transcript ──────────────────────────────────────────────────────────────
+# Every runner's stdout+stderr lands in <log_dir>/runner.log, in ALL modes.
+#
+# This is a pipeline, not `exec > >(tee ...)`, on purpose: process substitution
+# spawns a background process in the runner's own job table, and uvv_run_queue
+# bounds concurrency with `jobs -rp | wc -l` plus `wait -n`. A stray never-exiting
+# tee job in that table silently eats a worker slot, and at CONCURRENCY=1 it
+# deadlocks the queue outright. In a pipeline the tee belongs to the pipeline, so
+# `jobs` inside <main_fn> stays clean.
+#
+# `set -o pipefail` is already on, so a failing main still fails the script.
+#
+# uvv_run_main <log_dir> <main_fn> [args...]
+uvv_run_main() {
+    local log_dir="$1"; shift
+    local main_fn="$1"; shift
+    mkdir -p "$log_dir"
+    "$main_fn" "$@" 2>&1 | tee -a "$log_dir/runner.log"
+}
+
+# What was actually running when it broke. Call AFTER uvv_activate_env so the
+# reported python is the environment's, not the login shell's.
+uvv_log_provenance() {
+    local root="${UV_VAE_DIR:-$HOME/uv_vae}"
+    uvv_rule
+    echo "run provenance"
+    echo "  host        : $(hostname 2>/dev/null || echo '?')"
+    echo "  user        : ${USER:-?}"
+    echo "  date (utc)  : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "  cwd         : $PWD"
+    echo "  bash        : $BASH_VERSION"
+    echo "  python      : $(command -v python 2>/dev/null || echo 'not found')"
+    python -c 'import sys; print("  python ver  :", sys.version.split()[0])' 2>/dev/null || true
+    python -c 'import torch; print("  torch       :", torch.__version__, "| cuda", torch.version.cuda, "| available", torch.cuda.is_available())' 2>/dev/null \
+        || echo "  torch       : (import failed -- wrong env?)"
+    if command -v git >/dev/null 2>&1 && git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+        local sha dirty=""
+        sha="$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo '?')"
+        git -C "$root" diff --quiet 2>/dev/null || dirty=" (uncommitted changes)"
+        echo "  git         : ${sha}${dirty}"
+    fi
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>/dev/null \
+            | sed 's/^/  gpu         : /' || true
+    else
+        echo "  gpu         : nvidia-smi not found"
+    fi
+    echo "  determinism : CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-unset} PYTHONHASHSEED=${PYTHONHASHSEED:-unset}"
+    echo "  cuml        : UV_VAE_ENABLE_CUML=${UV_VAE_ENABLE_CUML:-unset}"
+    uvv_rule
+}
+
+# ── Error digest ────────────────────────────────────────────────────────────
+# Case-SENSITIVE on purpose. A case-insensitive /error/ matches "reconstruction
+# error" and "error: 0.0142" in ordinary trainer output, which buries the real
+# failures. The capitalised forms below are what tracebacks and log levels use.
+UVV_ERROR_PATTERN='Traceback \(most recent call last\)|^[[:space:]]*(ERROR|FATAL|CRITICAL)\b|[A-Za-z]*Error:|[A-Za-z]*Exception:|CUDA out of memory|[Oo]ut of memory|Killed|Segmentation fault|core dumped|FAILED|WARNING|UserWarning|FutureWarning|Preflight failed|EXCEEDS BUDGET'
+
+# uvv_collect_errors <log_dir>
+# Scans every *.log in <log_dir> and concentrates the failure lines into one
+# errors.log, each with the tail of its source log for context. Purely a
+# reporting aid -- it never changes the exit status.
+uvv_collect_errors() {
+    local log_dir="$1"
+    local out="$log_dir/errors.log"
+    [ -d "$log_dir" ] || return 0
+
+    local found=0 log hits
+    {
+        echo "# error digest -- generated $(date '+%F %T')"
+        echo "# scanned: $log_dir/*.log"
+        echo "# pattern is case-sensitive; 'reconstruction error' style output is not a match."
+        echo
+    } > "$out"
+
+    for log in "$log_dir"/*.log; do
+        [ -f "$log" ] || continue
+        [ "$log" = "$out" ] && continue
+        hits="$(grep -nE -- "$UVV_ERROR_PATTERN" "$log" 2>/dev/null || true)"
+        [ -n "$hits" ] || continue
+        found=$((found + 1))
+        {
+            uvv_rule
+            echo "## $(basename "$log")"
+            uvv_rule
+            printf '%s\n' "$hits"
+            echo
+            echo "--- last 25 lines of $(basename "$log") ---"
+            tail -n 25 "$log" 2>/dev/null || true
+            echo
+        } >> "$out"
+    done
+
+    if [ "$found" -eq 0 ]; then
+        echo "(no matching error or warning lines)" >> "$out"
+        uvv_log "error digest: clean -> $out"
+    else
+        uvv_log "error digest: $found log(s) contain error/warning lines -> $out"
+    fi
+    return 0
+}
+
 # ── Environment ─────────────────────────────────────────────────────────────
 uvv_detect_cores() {
     if command -v nproc >/dev/null 2>&1; then
@@ -95,6 +197,7 @@ uvv_activate_env() {
 
 # Exported once per RUNNER process, then inherited by every task.
 uvv_export_determinism() {
+    # 42 is default seed in original uv_vae pipeline
     local seed="${1:-42}"
     export PYTHONHASHSEED="$seed"
     # Must be in the environment BEFORE python starts: cuBLAS reads it when it
@@ -104,6 +207,7 @@ uvv_export_determinism() {
     export TQDM_DISABLE=1
     # cuML patches sklearn/UMAP/HDBSCAN globally and its HDBSCAN has no
     # relative_validity_. Training does not want it; opt in per-stage instead.
+    # defaults enabling CUML to 0 , specific runner needs UV_VAE_ENABLE_CUML=1 to enable -> parsed in train_with_early_stopping.py
     export UV_VAE_ENABLE_CUML="${UV_VAE_ENABLE_CUML:-0}"
 }
 
@@ -111,10 +215,14 @@ uvv_export_determinism() {
 # Both caps are per PROCESS, so N workers each taking the full budget would be N
 # times the intended footprint.
 uvv_plan_resources() {
+    # number of jobs requested that get split into partitions of requested GPU / cores
     local concurrency="$1"
+    # GPU GB requested
     local gpu_total="${GPU_TOTAL_GB:-16}"
+    # finds total of threads by nproc in CPU
     local threads_total="${THREADS_TOTAL:-$(uvv_detect_cores)}"
 
+    # does integer division between GPU gigs and threads in CPU 
     UVV_GPU_PER_WORKER=$(awk -v t="$gpu_total" -v c="$concurrency" 'BEGIN{printf "%.2f", t/c}')
     UVV_THREADS_PER_WORKER=$(( threads_total / concurrency ))
     [ "$UVV_THREADS_PER_WORKER" -lt 1 ] && UVV_THREADS_PER_WORKER=1
@@ -128,9 +236,15 @@ uvv_plan_resources() {
 uvv_report_batch_ceiling() {
     local budget="$1"; shift
     local batches=("$@")
+    # UVV_SHAPE_PARQUET / UVV_SHAPE_FILTER are optional: with them the all-null
+    # columns are measured and dropped exactly as training drops them, which on
+    # the production featuremap is 14 of the 29 numerics. Without them the
+    # pre-drop shape is used, which over-estimates and so under-estimates the
+    # ceiling -- safe, just conservative.
     python - "$budget" "${batches[@]}" <<'PY' || true
+import os
 import sys
-sys.path.insert(0, __import__("os").environ.get("UV_VAE_DIR", "."))
+sys.path.insert(0, os.environ.get("UV_VAE_DIR", "."))
 try:
     from uv_vae import gpu_budget
 except Exception as exc:
@@ -138,12 +252,18 @@ except Exception as exc:
     raise SystemExit(0)
 
 budget = float(sys.argv[1])
-# ml_features.json shape; matches scripts/gpu_preflight.py defaults.
-per_row = gpu_budget.bytes_per_row(
-    n_categorical=11, n_numeric=30, embedding_dims=[8] * 11,
-    hidden_dims=[256, 128], latent_dim=16,
-    categorical_cardinalities=[16] * 11, amp=True,
-)
+spec_path = os.environ.get("UV_VAE_DIR", ".") + "/ml_features.json"
+parquet = os.environ.get("UVV_SHAPE_PARQUET", "").strip()
+row_filter = os.environ.get("UVV_SHAPE_FILTER", "").strip() or None
+
+if parquet:
+    shape = gpu_budget.shape_from_parquet(spec_path, parquet, where=row_filter)
+else:
+    shape = gpu_budget.shape_from_specs(spec_path)
+
+print(f"  model shape {shape.n_categorical} categorical + {shape.n_numeric} numeric"
+      + (f" ({len(shape.dropped_features)} all-null dropped)" if shape.dropped_features else ""))
+per_row = shape.bytes_per_row([256, 128], 16, amp=True)
 ceiling = gpu_budget.max_batch_rows(per_row, budget_gb=budget)
 print(f"  GPU budget {budget:.2f} GB/worker -> largest safe batch ~{ceiling:,} rows")
 over = []

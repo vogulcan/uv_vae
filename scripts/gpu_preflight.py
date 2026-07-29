@@ -31,6 +31,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from uv_vae import gpu_budget
+from uv_vae.features import DEFAULT_FEATURE_SPEC_PATH
 
 # Architectures the Blackwell workstation cards report. sm_120 is RTX PRO / RTX 50xx.
 BLACKWELL = {"sm_100", "sm_120"}
@@ -58,9 +59,14 @@ def parse_args() -> argparse.Namespace:
                              f"{gpu_budget.DEFAULT_BUDGET_GB:.0f}")
     parser.add_argument("--latent-dim", type=int, default=16)
     parser.add_argument("--hidden-dims", default="256,128")
-    parser.add_argument("--n-categorical", type=int, default=11,
-                        help="categorical features in ml_features.json")
-    parser.add_argument("--n-numeric", type=int, default=30)
+    parser.add_argument("--feature-spec-path", default=None,
+                        help="ml_features.json; the model shape is read from it "
+                             "rather than assumed")
+    parser.add_argument("--parquet-path", default=None,
+                        help="if given, all-null columns are measured and dropped "
+                             "exactly as training drops them")
+    parser.add_argument("--row-filter", default=None,
+                        help="WHERE clause applied to the null scan")
     parser.add_argument("--json-out", default=None)
     parser.add_argument("--allow-cpu", action="store_true",
                         help="report instead of failing when no GPU is present")
@@ -144,18 +150,20 @@ def main() -> int:
               + ")")
 
     hidden_dims = [int(part) for part in args.hidden_dims.split(",") if part.strip()]
-    # ml_features.json categoricals are small; embedding dims land at 4-16.
-    embedding_dims = [8] * args.n_categorical
-    cardinalities = [16] * args.n_categorical
-    per_row = gpu_budget.bytes_per_row(
-        n_categorical=args.n_categorical,
-        n_numeric=args.n_numeric,
-        embedding_dims=embedding_dims,
-        hidden_dims=hidden_dims,
-        latent_dim=args.latent_dim,
-        categorical_cardinalities=cardinalities,
-        amp=True,
-    )
+    spec_path = args.feature_spec_path or DEFAULT_FEATURE_SPEC_PATH
+    if args.parquet_path:
+        shape = gpu_budget.shape_from_parquet(
+            spec_path, args.parquet_path, where=args.row_filter
+        )
+    else:
+        shape = gpu_budget.shape_from_specs(spec_path)
+    print(f"  model shape: {shape.n_categorical} categorical "
+          f"(cardinalities {shape.categorical_cardinalities}, "
+          f"embeddings {shape.embedding_dims}) + {shape.n_numeric} numeric")
+    if shape.dropped_features:
+        print(f"  dropped as all-null ({len(shape.dropped_features)}): "
+              f"{', '.join(shape.dropped_features)}")
+    per_row = shape.bytes_per_row(hidden_dims, args.latent_dim, amp=True)
     ceiling = gpu_budget.max_batch_rows(per_row, budget_gb=args.budget_gb)
     fits = args.batch_size <= ceiling
     projected = args.batch_size * per_row / gpu_budget.BYTES_PER_GB
@@ -171,7 +179,7 @@ def main() -> int:
     # ---- 6. a real allocation of that size ---------------------------------
     try:
         probe_rows = min(args.batch_size, ceiling)
-        probe = torch.empty((probe_rows, args.n_numeric), dtype=torch.float32, device="cuda")
+        probe = torch.empty((probe_rows, shape.n_numeric), dtype=torch.float32, device="cuda")
         del probe
         torch.cuda.empty_cache()
         check.add("allocation_probe", True,

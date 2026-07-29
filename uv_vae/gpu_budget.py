@@ -266,6 +266,97 @@ def bytes_per_row(
     return int(input_elements + activation_bytes)
 
 
+@dataclass
+class ModelShape:
+    """Input shape of the VAE, derived from a feature spec rather than retyped.
+
+    The hardcoded shape this replaces was wrong in two ways: ``n_numeric=30``
+    (ml_features.json has 29, and only 15 survive the all-null drop on the
+    production featuremap) and uniform ``cardinalities=[16]*11`` /
+    ``embedding_dims=[8]*11`` (real cardinalities are 5, 8 or 16, giving embedding
+    dims of 6 or 8). Both errors inflate the per-row estimate, so the batch ceiling
+    came out lower than the card can actually take.
+    """
+
+    n_categorical: int
+    n_numeric: int
+    embedding_dims: list[int]
+    categorical_cardinalities: list[int]
+    dropped_features: list[str] = field(default_factory=list)
+
+    def bytes_per_row(self, hidden_dims: list[int], latent_dim: int, amp: bool = True) -> int:
+        return bytes_per_row(
+            n_categorical=self.n_categorical,
+            n_numeric=self.n_numeric,
+            embedding_dims=self.embedding_dims,
+            hidden_dims=hidden_dims,
+            latent_dim=latent_dim,
+            categorical_cardinalities=self.categorical_cardinalities,
+            amp=amp,
+        )
+
+
+def shape_from_specs(
+    feature_spec_path,
+    non_null_counts: dict[str, int] | None = None,
+) -> ModelShape:
+    """Read the model's input shape out of ``ml_features.json``.
+
+    ``non_null_counts`` applies the same drop :func:`uv_vae.data.split_specs`
+    performs at training time, so the estimate matches the model that actually
+    gets built. Pass ``None`` for the pre-drop shape, which is the pessimistic
+    (safe) answer when the parquet has not been scanned.
+
+    Imported lazily so this module keeps its promise of importing without torch,
+    CUDA, polars or duckdb present.
+    """
+    from uv_vae.data import split_specs
+    from uv_vae.features import load_feature_specs
+    from uv_vae.preprocess import infer_embedding_dim
+
+    specs = load_feature_specs(feature_spec_path)
+    if non_null_counts is None:
+        non_null_counts = {spec.name: 1 for spec in specs}
+    categorical_specs, numeric_specs, dropped = split_specs(specs, non_null_counts)
+
+    cardinalities = [spec.cardinality for spec in categorical_specs]
+    return ModelShape(
+        n_categorical=len(categorical_specs),
+        n_numeric=len(numeric_specs),
+        embedding_dims=[infer_embedding_dim(value) for value in cardinalities],
+        categorical_cardinalities=cardinalities,
+        dropped_features=dropped,
+    )
+
+
+def shape_from_parquet(
+    feature_spec_path,
+    parquet_path,
+    where: str | None = None,
+    threads: int | None = None,
+) -> ModelShape:
+    """:func:`shape_from_specs` with the all-null columns actually measured.
+
+    Falls back to the pre-drop shape if the scan fails for any reason -- a
+    planning estimate must never be the thing that stops a run from starting.
+    """
+    from uv_vae.data import connect_duckdb, get_non_null_counts
+    from uv_vae.features import load_feature_specs
+
+    try:
+        specs = load_feature_specs(feature_spec_path)
+        conn = connect_duckdb(threads=threads)
+        try:
+            counts = get_non_null_counts(
+                conn, parquet_path, [spec.name for spec in specs], where=where
+            )
+        finally:
+            conn.close()
+        return shape_from_specs(feature_spec_path, counts)
+    except Exception:
+        return shape_from_specs(feature_spec_path)
+
+
 def max_batch_rows(
     per_row_bytes: int,
     budget_gb: float | None = None,
