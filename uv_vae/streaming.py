@@ -26,6 +26,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import pyarrow as pa
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -336,7 +337,7 @@ class StreamingParquetDataset(IterableDataset):
                     continue
 
                 if self._use_cudf:
-                    df = _cudf.DataFrame.from_arrow(record_batch)
+                    df = _cudf.DataFrame.from_arrow(pa.Table.from_batches([record_batch]))
                     split_df = df[_cudf.Series(keep)]
                     cat, num, mask = self._encode_chunk_gpu(split_df)
                 else:
