@@ -152,7 +152,15 @@ def stream_parquet_batches(
         where=where,
         limit=limit,
     )
-    return conn.execute(sql, [str(parquet_path)]).fetch_record_batch(rows_per_batch=rows_per_batch)
+    result = conn.execute(sql, [str(parquet_path)])
+    # fetch_record_batch is deprecated in favour of to_arrow_reader.  tosun still
+    # runs an older duckdb that has only the former, so prefer the new name and
+    # fall back rather than pinning a version.  Both take the batch size as their
+    # first positional argument; the keyword differs, so do not name it.
+    reader = getattr(result, "to_arrow_reader", None)
+    if reader is None:
+        return result.fetch_record_batch(rows_per_batch=rows_per_batch)
+    return reader(rows_per_batch)
 
 
 def split_specs(
