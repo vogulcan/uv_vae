@@ -54,7 +54,8 @@ uv run pytest tests/
 - Env on miletus: **micromamba `uv_vae`** (override with `MAMBA_ENV`)
 - Older CPU cluster: `tosun.sabanciuniv.edu`, user `patrickgao765`; conda env `patrickg`
 - SLURM: account=adelab, partition=genomics, qos=adelab
-- Parquet files: `/cta/users/patrickgao765/parquet_files/`
+- Parquet files: `/data/lab/ppmseq_parquets/` (miletus, shared lab folder),
+  `/cta/users/patrickgao765/parquet_files/` (tosun)
 - Test set: `/cta/users/patrickgao765/uv_vae/test_set.parquet`
 - Always set `export TQDM_DISABLE=1` in SLURM scripts (non-interactive)
 - Always set `export UV_VAE_ROOT="$HOME/uv_vae"` before running sweep scripts

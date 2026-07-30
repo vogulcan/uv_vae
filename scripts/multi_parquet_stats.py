@@ -6,9 +6,9 @@ that no sample is starved of draws at the chosen batch size -- and the cache it
 writes is reused by every later run, so it is not throwaway work.
 
     python uv_vae/scripts/multi_parquet_stats.py \
-        --parquet-paths '/cta/users/patrickgao765/parquet_files/*.featuremap.parquet' \
+        --parquet-paths '/data/lab/ppmseq_parquets/*.featuremap.parquet' \
         --feature-spec-path uv_vae/ml_features.json \
-        --stats-cache-path ~/uv_vae/stats_cache.json \
+        --stats-cache-path ~/pure-internship/uv_vae/stats_cache.json \
         --batch-size 8192
 
 It imports nothing from torch, so it runs on a login node.
