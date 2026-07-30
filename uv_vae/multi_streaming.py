@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import glob
 import os
+import queue
 import sys
+import threading
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,6 +54,47 @@ from uv_vae.training import TrainingConfig, seed_everything, write_json
 # Cap on validation rows read per epoch. See InterleavedRowSource.cap_rows: an
 # uncapped site-keyed validation split costs a full pass over every file.
 DEFAULT_VAL_MAX_ROWS = 5_000_000
+
+
+class _PrefetchLoader:
+    """Decodes the next batch on a background thread while the GPU trains.
+
+    Wraps any iterable of (cat, num, mask) tensors. The background thread
+    stays one batch ahead; GPU time and CPU decode time overlap instead of
+    serialising. Uses a queue of depth 1 -- deep queues consume more host RAM
+    and add latency without helping throughput when the bottleneck is steady
+    decode speed rather than bursty I/O.
+    """
+
+    _SENTINEL = object()
+
+    def __init__(self, loader, device: torch.device) -> None:
+        self._loader = loader
+        self._device = device
+
+    def __iter__(self):
+        q: queue.Queue = queue.Queue(maxsize=1)
+
+        def _worker():
+            try:
+                for batch in self._loader:
+                    q.put(batch)
+            finally:
+                q.put(self._SENTINEL)
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        while True:
+            item = q.get()
+            if item is self._SENTINEL:
+                break
+            cat, num, mask = item
+            yield (
+                cat.to(self._device, non_blocking=True),
+                num.to(self._device, non_blocking=True),
+                mask.to(self._device, non_blocking=True),
+            )
+        t.join()
 
 
 class InterleavedDataset(IterableDataset):
@@ -269,8 +312,8 @@ def train_interleaved(
 
     train_dataset = InterleavedDataset(train_source)
     val_dataset = InterleavedDataset(val_source)
-    train_loader = DataLoader(train_dataset, batch_size=None)
-    val_loader = DataLoader(val_dataset, batch_size=None)
+    train_loader = _PrefetchLoader(DataLoader(train_dataset, batch_size=None, pin_memory=device.type == "cuda"), device)
+    val_loader = _PrefetchLoader(DataLoader(val_dataset, batch_size=None, pin_memory=device.type == "cuda"), device)
 
     interleave = train_source.describe()
 
