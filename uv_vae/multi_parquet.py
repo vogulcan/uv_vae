@@ -58,8 +58,10 @@ testable without it.  The ``IterableDataset`` wrapper lives in
 
 from __future__ import annotations
 
+import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -80,6 +82,17 @@ DEFAULT_SHUFFLE_BUFFER_ROWS = 32_768
 MIN_ROW_GROUPS_PER_EPOCH = 20
 
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def gpu_decode_requested() -> bool:
+    """Whether to try the cuDF decode path (``UV_VAE_GPU_DECODE=1``).
+
+    Off by default.  The GPU path must be bit-identical to the CPU one -- it
+    decides the train/val split -- and that is asserted by ``test_gpu_decode.py``,
+    which can only run on a machine with cuDF.  Until it has passed on the target
+    host, the default must remain the path every existing result came from.
+    """
+    return os.environ.get("UV_VAE_GPU_DECODE", "").strip().lower() in {"1", "true", "yes"}
 
 
 def columns_referenced(sql_fragment: str | None, available: set[str]) -> set[str]:
@@ -244,6 +257,7 @@ class ParquetSampleReader:
         shuffle_buffer_rows: int = DEFAULT_SHUFFLE_BUFFER_ROWS,
         epoch_varying: bool = True,
         row_group_limit: int | None = None,
+        use_gpu: bool | None = None,
     ) -> None:
         self.source = source
         self.encoder = encoder
@@ -251,6 +265,19 @@ class ParquetSampleReader:
         self.split = split
         self.row_filter = row_filter
         self.seed = seed
+        # Wall-clock inside the decode, split by stage. The reason this is here
+        # rather than in a profiler: the interleave pulls from 95 readers in turn
+        # on one thread, so an external sampling profiler attributes everything to
+        # __iter__ and cannot say whether the cost is parquet decompression, the
+        # filter, the split hash or the encode -- which is exactly what decides
+        # whether moving the decode to the GPU is worth anything.
+        self.timings: dict[str, float] = {
+            "read": 0.0,
+            "filter": 0.0,
+            "split": 0.0,
+            "encode": 0.0,
+        }
+        self.groups_decoded = 0
         self.shuffle_buffer_rows = max(1, int(shuffle_buffer_rows))
         # Training reshuffles row groups every epoch and permutes each buffer.
         # Validation does neither: its row-group order is shuffled ONCE with a
@@ -287,6 +314,42 @@ class ParquetSampleReader:
                 f"{split_config.strategy!r}"
             )
         self._read_columns = sorted(needed)
+
+        # ---- optional GPU decode ----
+        # Resolved once, here, rather than per row group: a reader that cannot use
+        # the GPU (unsupported filter, cuDF absent) must decode on the CPU for the
+        # whole run, not flip between paths mid-epoch.
+        self._gpu = None
+        self._gpu_filter = None
+        want_gpu = gpu_decode_requested() if use_gpu is None else bool(use_gpu)
+        if want_gpu:
+            from uv_vae import gpu_decode
+
+            if not gpu_decode.gpu_decode_available():
+                print(
+                    "[multi_parquet] UV_VAE_GPU_DECODE set but cudf/cupy are not "
+                    "importable; decoding on the CPU.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                try:
+                    self._gpu_filter = gpu_decode.compile_filter(row_filter, available)
+                except gpu_decode.UnsupportedFilter as exc:
+                    print(
+                        f"[multi_parquet] row filter cannot be translated to cuDF "
+                        f"({exc}); decoding on the CPU.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    self._gpu = gpu_decode
+                    self._gpu_encoder = gpu_decode.GpuRowEncoder(
+                        encoder.categorical_specs,
+                        encoder.numeric_specs,
+                        {s.name: float(m) for s, m in zip(encoder.numeric_specs, encoder.means)},
+                        {s.name: float(d) for s, d in zip(encoder.numeric_specs, encoder.stds)},
+                    )
 
         self._order: np.ndarray = np.arange(self.num_row_groups)
         self._cursor_group = 0
@@ -349,23 +412,37 @@ class ParquetSampleReader:
     # -- reading ----------------------------------------------------------
 
     def _decode_group(self, group_index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        self.groups_decoded += 1
+        if self._gpu is not None:
+            return self._decode_group_gpu(group_index)
+        return self._decode_group_cpu(group_index)
+
+    def _decode_group_cpu(self, group_index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        clock = time.perf_counter
+        mark = clock()
         table = self._handle.read_row_group(group_index, columns=self._read_columns)
         if table.num_rows == 0:
+            self.timings["read"] += clock() - mark
             return None
         frame = pl.from_arrow(table)
+        self.timings["read"] += clock() - mark
 
         start = int(self._group_start[group_index])
         positions = np.arange(start, start + table.num_rows, dtype=np.int64)
 
+        mark = clock()
         if self.row_filter:
             frame = frame.with_columns(pl.Series("__row_position", positions))
             frame = pl.SQLContext(rows=frame).execute(
                 f"SELECT * FROM rows WHERE {self.row_filter}", eager=True
             )
             if frame.height == 0:
+                self.timings["filter"] += clock() - mark
                 return None
             positions = frame.get_column("__row_position").to_numpy()
+        self.timings["filter"] += clock() - mark
 
+        mark = clock()
         keep = split_mask(
             self.split_config,
             self.source.sample_id,
@@ -374,10 +451,80 @@ class ParquetSampleReader:
             row_positions=positions,
         )
         if not keep.any():
+            self.timings["split"] += clock() - mark
             return None
         frame = frame.filter(pl.Series(keep))
+        self.timings["split"] += clock() - mark
 
-        return self.encoder.encode(frame)
+        mark = clock()
+        encoded = self.encoder.encode(frame)
+        self.timings["encode"] += clock() - mark
+        return encoded
+
+    def _decode_group_gpu(self, group_index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        """cuDF decode of one row group. Must match ``_decode_group_cpu`` exactly.
+
+        Arrays come back to the host at the end: the shuffle buffer and the
+        interleave assembly are numpy, and reworking them in cuPy is a separate
+        change. The copy is of the ENCODED arrays (post filter and post split, so
+        ~24% of the group at ~320 B/row) rather than the raw columns, and the
+        prefetch thread in ``multi_streaming`` overlaps it with GPU compute.
+        """
+        cudf, cupy = self._gpu.gpu_modules()
+        clock = time.perf_counter
+
+        mark = clock()
+        frame = cudf.read_parquet(
+            self.source.path,
+            columns=self._read_columns,
+            row_groups=[[group_index]],
+        )
+        self.timings["read"] += clock() - mark
+        if len(frame) == 0:
+            return None
+
+        start = int(self._group_start[group_index])
+        raw_height = len(frame)
+
+        mark = clock()
+        positions = cupy.arange(start, start + raw_height, dtype=cupy.int64)
+        if self._gpu_filter is not None:
+            selector = self._gpu_filter(frame).values
+            frame = frame[cudf.Series(selector)]
+            positions = positions[selector]
+            # Boolean masking keeps the ORIGINAL index labels. cuDF aligns a
+            # boolean Series mask on the index, so masking again with a fresh
+            # 0..n-1 Series would align against those stale labels and silently
+            # select the wrong rows. Reset after every filter.
+            frame = frame.reset_index(drop=True)
+            if len(frame) == 0:
+                self.timings["filter"] += clock() - mark
+                return None
+        self.timings["filter"] += clock() - mark
+
+        mark = clock()
+        keep = self._gpu.gpu_split_mask(
+            self.split_config,
+            self.source.sample_id,
+            self.split,
+            frame=frame,
+            row_positions=cupy.asnumpy(positions),
+        )
+        if not bool(keep.any()):
+            self.timings["split"] += clock() - mark
+            return None
+        frame = frame[cudf.Series(keep)].reset_index(drop=True)
+        self.timings["split"] += clock() - mark
+
+        mark = clock()
+        categorical, numeric, mask = self._gpu_encoder.encode(frame)
+        encoded = (
+            cupy.asnumpy(categorical),
+            cupy.asnumpy(numeric),
+            cupy.asnumpy(mask),
+        )
+        self.timings["encode"] += clock() - mark
+        return encoded
 
     def _refill(self) -> bool:
         """Decode row groups until the buffer is full or the epoch's groups run out.
@@ -541,6 +688,7 @@ class InterleavedRowSource:
         shuffle_buffer_rows: int = DEFAULT_SHUFFLE_BUFFER_ROWS,
         epoch_varying: bool = True,
         row_group_limits: dict[str, int] | None = None,
+        use_gpu: bool | None = None,
     ) -> None:
         if not sources:
             raise ValueError("InterleavedRowSource needs at least one sample source")
@@ -568,9 +716,11 @@ class InterleavedRowSource:
                 shuffle_buffer_rows=shuffle_buffer_rows,
                 epoch_varying=epoch_varying,
                 row_group_limit=limits.get(source.sample_id),
+                use_gpu=use_gpu,
             )
             for source in sources
         ]
+        self.gpu_decode = any(reader._gpu is not None for reader in self.readers)
 
         counts = np.array([source.rows for source in sources], dtype=np.float64)
         self.weights = counts / counts.sum()
@@ -679,6 +829,32 @@ class InterleavedRowSource:
             reader.row_group_limit = limits[reader.source.sample_id]
         self.set_epoch(self._epoch)
         return limits
+
+    def decode_timings(self) -> dict:
+        """Decode wall-clock summed over every reader, split by stage.
+
+        Answers the only question that decides whether GPU decode is worth
+        enabling: of the time the loader spends not-training, how much is parquet
+        decompression versus the filter, the split hash and the encode. Summed
+        across readers because they are pulled from one at a time on one thread,
+        so the sum IS the wall-clock the GPU spent waiting.
+        """
+        stages = ("read", "filter", "split", "encode")
+        totals = {stage: 0.0 for stage in stages}
+        for reader in self.readers:
+            for stage in stages:
+                totals[stage] += reader.timings[stage]
+        grand = sum(totals.values())
+        return {
+            "backend": "gpu" if self.gpu_decode else "cpu",
+            "groups_decoded": sum(r.groups_decoded for r in self.readers),
+            "seconds": {stage: round(totals[stage], 3) for stage in stages},
+            "seconds_total": round(grand, 3),
+            "share": {
+                stage: (round(totals[stage] / grand, 4) if grand else 0.0)
+                for stage in stages
+            },
+        }
 
     def describe(self) -> InterleaveReport:
         return InterleaveReport(

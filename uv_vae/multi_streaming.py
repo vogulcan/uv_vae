@@ -160,22 +160,30 @@ def _rmm_share_for_interleaved() -> float | None:
     ``_cap_rmm`` really does allocate an initial quarter of that pool up front.
     At a 16 GB budget that is 4 GB reserved and 1 GB allocated for nothing.
 
-    So the answer is normally 0.0: torch gets the whole budget.  Two cases must
+    So the answer is normally 0.0: torch gets the whole budget.  Three cases must
     still bound RMM, because an *unbounded* pool grows toward all free memory and
     the torch cap then buys nothing -- the exact failure ``gpu_budget`` exists to
     prevent:
 
     * ``UV_VAE_ENABLE_CUML=1`` -- the CLI installs ``cuml.accel`` for a downstream
       clustering stage in this same process, and cuML allocates through RMM.
+    * ``UV_VAE_GPU_DECODE=1`` -- the cuDF decode path in ``multi_parquet`` reads
+      parquet and encodes on the device, so the premise of this whole function
+      ("nothing here allocates from RMM") no longer holds and the pool must be
+      bounded rather than zeroed. Zeroing it would not disable cuDF; it would let
+      cuDF allocate outside the budget this function exists to enforce.
     * ``UV_VAE_RMM_SHARE`` set explicitly -- the operator has made a decision;
       returning None lets :func:`gpu_budget.resolve_rmm_share` read it, so the
       env var keeps winning as it does everywhere else.
 
-    The ``UV_VAE_ENABLE_CUML`` test is deliberately looser than the CLI's (it
-    lowercases), so an odd spelling errs toward reserving the pool rather than
-    leaving cuML unbounded.
+    The env tests are deliberately looser than the CLI's (they lowercase), so an
+    odd spelling errs toward reserving the pool rather than leaving cuDF or cuML
+    unbounded.
     """
-    if os.environ.get("UV_VAE_ENABLE_CUML", "").strip().lower() in {"1", "true", "yes"}:
+    truthy = {"1", "true", "yes"}
+    if os.environ.get("UV_VAE_ENABLE_CUML", "").strip().lower() in truthy:
+        return None
+    if os.environ.get("UV_VAE_GPU_DECODE", "").strip().lower() in truthy:
         return None
     if os.environ.get(gpu_budget.RMM_SHARE_ENV, "").strip():
         return None
@@ -438,6 +446,23 @@ def train_interleaved(
             postfix["proc"] = f"{convergence_metrics['procrustes_distance']:.4f}"
         progress.set_postfix(**postfix)
 
+        # Printed every epoch rather than only into the final report: the run is
+        # long, and knowing after epoch 1 whether the loader is dominated by
+        # parquet decompression or by the encode is what tells you which knob to
+        # reach for without waiting for early stopping.
+        decode = train_source.decode_timings()
+        if decode["seconds_total"] > 0:
+            share = decode["share"]
+            print(
+                f"  epoch {epoch} decode [{decode['backend']}] "
+                f"{decode['seconds_total']:.1f}s cumulative over "
+                f"{decode['groups_decoded']:,} row groups -- "
+                f"read {share['read']:.0%} filter {share['filter']:.0%} "
+                f"split {share['split']:.0%} encode {share['encode']:.0%}",
+                file=sys.stderr,
+                flush=True,
+            )
+
         if should_stop:
             progress.close()
             print(
@@ -476,6 +501,13 @@ def train_interleaved(
         "sample_count": len(sources),
         "total_filtered_rows": total_rows,
         "interleave": interleave.as_dict(),
+        # Where the loader's time actually went. The interleaved path is CPU/IO
+        # bound (GPU at ~28% on the first cohort run), so which decode stage
+        # dominates is what decides whether UV_VAE_GPU_DECODE is worth enabling.
+        "decode_timings": {
+            "train": train_source.decode_timings(),
+            "val": val_source.decode_timings(),
+        },
         "train_rows_served": dict(train_source.last_report.rows_served),
         "val_rows_served": dict(val_source.last_report.rows_served),
         "train_batches_last_epoch": train_source.last_report.batches,
