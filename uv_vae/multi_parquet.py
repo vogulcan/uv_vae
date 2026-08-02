@@ -44,6 +44,14 @@ the streaming default chunk size would want ~5.7 GB and spill.  The batch loop
 pulls from one reader at a time, so peak decode memory is one row group
 regardless of how many files are open.
 
+  ``decode_workers`` > 1 relaxes this to ``decode_workers`` row groups in flight,
+  which is why it defaults to 1.  It exists because encode+split are
+  single-threaded numpy and were measured at 41-42% of decode time on the 95-file
+  cohort, i.e. ~290s per epoch on one core while 47 sat idle.  On the CPU path the
+  extra memory is host RAM (tens of MB per row group) and harmless.  **Do not
+  combine it with UV_VAE_GPU_DECODE=1** -- that is exactly the 4 GB RMM pool this
+  paragraph is about, and N concurrent decodes would multiply into it.
+
 *One DuckDB instance, not 95.*  ``connect_duckdb`` opens a fresh in-memory
 *database* per call, each with its own buffer manager, memory limit near 80% of
 system RAM, and thread pool.  This module does not open any: the row filter is
@@ -62,6 +70,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -288,7 +297,24 @@ class ParquetSampleReader:
         self.epoch_varying = epoch_varying
         self.row_group_limit = row_group_limit
 
-        self._handle = pq.ParquetFile(source.path, pre_buffer=False, memory_map=False)
+        # pre_buffer coalesces a row group's ~26 column-chunk reads into fewer, larger
+        # I/O requests issued through pyarrow's IO thread pool, instead of one synchronous
+        # read per column. Read is 54-58% of decode time here, so this is the main handle
+        # on the dominant stage. It is opt-in because it holds one row group's COMPRESSED
+        # bytes per reader before parsing -- small (single-digit MB), but multiplied by 95
+        # open readers, so it is worth measuring rather than assuming.
+        # UV_VAE_IO_THREADS raises pyarrow's IO pool, which defaults to 8 against 48 cores
+        # and is what pre_buffer actually dispatches onto.
+        pre_buffer = os.environ.get("UV_VAE_PRE_BUFFER", "0") == "1"
+        io_threads = os.environ.get("UV_VAE_IO_THREADS", "").strip()
+        if io_threads:
+            try:
+                import pyarrow as pa
+
+                pa.set_io_thread_count(int(io_threads))
+            except Exception:
+                pass
+        self._handle = pq.ParquetFile(source.path, pre_buffer=pre_buffer, memory_map=False)
         metadata = self._handle.metadata
         self.num_row_groups = metadata.num_row_groups
         group_rows = [metadata.row_group(i).num_rows for i in range(self.num_row_groups)]
@@ -689,6 +715,7 @@ class InterleavedRowSource:
         epoch_varying: bool = True,
         row_group_limits: dict[str, int] | None = None,
         use_gpu: bool | None = None,
+        decode_workers: int = 1,
     ) -> None:
         if not sources:
             raise ValueError("InterleavedRowSource needs at least one sample source")
@@ -702,6 +729,10 @@ class InterleavedRowSource:
         self.batch_size = int(batch_size)
         self.split = split
         self.epoch_shards = max(1, int(epoch_shards))
+        # >1 decodes several readers' row groups concurrently. Safe for determinism
+        # because readers share no state (own buffer, own RNG, own row-group order) and
+        # results are reassembled in reader order -- see __iter__.
+        self.decode_workers = max(1, int(decode_workers))
         self._epoch = 0
 
         limits = row_group_limits or {}
@@ -884,42 +915,72 @@ class InterleavedRowSource:
             reader.set_epoch(self._epoch, epoch_shards=self.epoch_shards)
 
         report = self.describe()
-        while True:
-            parts_cat, parts_num, parts_mask = [], [], []
-            rows = 0
-            for reader, draw in zip(self.readers, self.draws, strict=True):
-                taken = reader.take(int(draw))
-                if taken is None:
-                    continue
-                parts_cat.append(taken[0])
-                parts_num.append(taken[1])
-                parts_mask.append(taken[2])
-                rows += taken[0].shape[0]
+        # One pool for the whole epoch: a per-batch pool would pay thread creation
+        # thousands of times. None when decode_workers == 1, which keeps the original
+        # single-threaded path exactly as it was.
+        pool = (
+            ThreadPoolExecutor(max_workers=self.decode_workers, thread_name_prefix="decode")
+            if self.decode_workers > 1 else None
+        )
+        try:
+            while True:
+                parts_cat, parts_num, parts_mask = [], [], []
+                rows = 0
+                # Most take() calls just slice an already-decoded buffer; only the few
+                # readers whose buffer ran dry actually decode. Those are the expensive
+                # ones and they are what overlaps here. executor.map yields in ARGUMENT
+                # order, not completion order, so the assembled batch is identical to
+                # what the sequential path produces -- which is what keeps a fixed seed
+                # reproducible.
+                if pool is not None:
+                    taken_all = pool.map(
+                        lambda pair: pair[0].take(int(pair[1])),
+                        zip(self.readers, self.draws, strict=True),
+                    )
+                else:
+                    taken_all = (
+                        reader.take(int(draw))
+                        for reader, draw in zip(self.readers, self.draws, strict=True)
+                    )
 
-            if rows == 0:
-                break
+                for taken in taken_all:
+                    if taken is None:
+                        continue
+                    parts_cat.append(taken[0])
+                    parts_num.append(taken[1])
+                    parts_mask.append(taken[2])
+                    rows += taken[0].shape[0]
 
-            cat = np.concatenate(parts_cat)
-            num = np.concatenate(parts_num)
-            mask = np.concatenate(parts_mask)
+                if rows == 0:
+                    break
 
-            # The batch is assembled sample-block by sample-block, so without this
-            # the rows arrive grouped by sample. Nothing downstream depends on row
-            # order within a batch, but a grouped batch makes any per-sample effect
-            # look like a within-batch trend to anyone inspecting one.
-            perm = np.random.default_rng(
-                stable_seed(self.split, self._epoch, report.batches)
-            ).permutation(rows)
+                cat = np.concatenate(parts_cat)
+                num = np.concatenate(parts_num)
+                mask = np.concatenate(parts_mask)
 
-            report.batches += 1
-            report.rows_emitted += rows
-            if rows == self.batch_size:
-                report.full_batches += 1
-            else:
-                report.ragged_batches += 1
-                report.ragged_rows += rows
+                # The batch is assembled sample-block by sample-block, so without this
+                # the rows arrive grouped by sample. Nothing downstream depends on row
+                # order within a batch, but a grouped batch makes any per-sample effect
+                # look like a within-batch trend to anyone inspecting one.
+                perm = np.random.default_rng(
+                    stable_seed(self.split, self._epoch, report.batches)
+                ).permutation(rows)
 
-            yield cat[perm], num[perm], mask[perm]
+                report.batches += 1
+                report.rows_emitted += rows
+                if rows == self.batch_size:
+                    report.full_batches += 1
+                else:
+                    report.ragged_batches += 1
+                    report.ragged_rows += rows
+
+                yield cat[perm], num[perm], mask[perm]
+        finally:
+            # Reached on normal exhaustion AND when the consumer abandons the
+            # generator mid-epoch (early stopping does exactly that), so the decode
+            # threads never outlive the iteration.
+            if pool is not None:
+                pool.shutdown(wait=True)
 
         for reader in self.readers:
             report.rows_served[reader.source.sample_id] = reader.rows_served

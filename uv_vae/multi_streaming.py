@@ -199,6 +199,10 @@ def train_interleaved(
     stats_cache_path: str | None = None,
     shuffle_buffer_rows: int = DEFAULT_SHUFFLE_BUFFER_ROWS,
     val_max_rows: int = DEFAULT_VAL_MAX_ROWS,
+    # Decode threads per row source. 1 keeps the original sequential path bit-for-bit;
+    # above 1 overlaps the per-reader decode (read/filter/split/encode), of which
+    # encode+split are single-threaded numpy and were measured at ~47% of decode time.
+    decode_workers: int = 1,
     input_dropout: float = 0.0,
     hidden_dropout: float = 0.0,
     test_parquet_path: str | None = None,
@@ -309,6 +313,7 @@ def train_interleaved(
         batch_size=batch_size,
         seed=config.seed,
         shuffle_buffer_rows=shuffle_buffer_rows,
+        decode_workers=decode_workers,
     )
     train_source = InterleavedRowSource(
         split="train", epoch_shards=epoch_shards, epoch_varying=True, **common
@@ -520,6 +525,7 @@ def train_interleaved(
         ),
         "epoch_shards": epoch_shards,
         "shuffle_buffer_rows": shuffle_buffer_rows,
+        "decode_workers": decode_workers,
         "split": split_config.as_dict(),
         "val_max_rows": val_max_rows,
         "val_row_group_limits": val_limits,

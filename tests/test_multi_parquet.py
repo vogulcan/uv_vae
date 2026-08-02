@@ -471,3 +471,52 @@ def test_row_hash_strategy_needs_no_site_columns(samples):
     )
     assert len(collect_rids(source)) > 0
     source.close()
+
+
+# --- parallel decode --------------------------------------------------------
+
+@pytest.mark.parametrize("workers", [2, 4, 8])
+def test_decode_workers_produce_identical_batches(samples, workers):
+    """N decode threads must give byte-identical batches to the sequential path.
+
+    This is the whole safety argument for parallel decode: readers share no state, and
+    ``executor.map`` yields in argument order rather than completion order, so the
+    assembled batch cannot depend on which thread finished first. If this ever fails,
+    a fixed seed has stopped reproducing a run.
+    """
+    sequential = list(build(samples, decode_workers=1))
+    parallel = list(build(samples, decode_workers=workers))
+
+    assert len(sequential) == len(parallel)
+    for index, (want, got) in enumerate(zip(sequential, parallel, strict=True)):
+        for name, a, b in zip(("cat", "num", "mask"), want, got, strict=True):
+            np.testing.assert_array_equal(a, b, err_msg=f"batch {index} {name} differs")
+
+
+def test_decode_workers_serve_every_row_exactly_once(samples):
+    """Parallel decode must not drop or duplicate rows -- same RID multiset as sequential."""
+    sequential = np.sort(collect_rids(build(samples, decode_workers=1)))
+    parallel = np.sort(collect_rids(build(samples, decode_workers=4)))
+    np.testing.assert_array_equal(sequential, parallel)
+    assert np.unique(parallel).size == parallel.size, "a row was served twice"
+
+
+def test_decode_workers_default_is_sequential(samples):
+    """The default must stay 1 so existing runs are bit-for-bit unchanged."""
+    source = build(samples)
+    assert source.decode_workers == 1
+    assert build(samples, decode_workers=0).decode_workers == 1, "must clamp to >= 1"
+
+
+def test_decode_workers_pool_shuts_down_on_abandoned_iteration(samples):
+    """Early stopping abandons the generator mid-epoch; the pool must not leak threads."""
+    import threading
+
+    before = threading.active_count()
+    iterator = iter(build(samples, decode_workers=4))
+    next(iterator)
+    del iterator
+    import gc
+
+    gc.collect()
+    assert threading.active_count() <= before + 1, "decode threads outlived the iteration"
