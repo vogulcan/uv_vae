@@ -56,6 +56,11 @@ AUTOGRAD_OVERHEAD = 2.5
 
 BYTES_PER_GB = 1024 ** 3
 
+# Size of the RMM pool this process has already installed, if any. ``rmm.reinitialize``
+# swaps the memory resource out from under whatever cuML has already allocated, so a
+# pool is installed once and never replaced by a smaller one -- see :func:`_cap_rmm`.
+_INSTALLED_POOL_BYTES: int | None = None
+
 
 @dataclass
 class BudgetReport:
@@ -69,6 +74,10 @@ class BudgetReport:
     # training_report.json shows how the one budget was divided.
     torch_budget_gb: float | None = None
     rmm_pool_gb: float = 0.0
+    # Why RMM ended up with the pool it did. A zero pool has three quite different
+    # causes -- absent, share=0, or a failed reinitialise -- and they used to print
+    # identically, which hid a mis-applied cap for a whole sweep.
+    rmm_note: str | None = None
     notes: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -79,6 +88,7 @@ class BudgetReport:
             "torch_fraction": self.torch_fraction,
             "torch_budget_gb": self.torch_budget_gb,
             "rmm_pool_gb": self.rmm_pool_gb,
+            "rmm_note": self.rmm_note,
             "notes": list(self.notes),
         }
 
@@ -180,31 +190,57 @@ def _cap_rmm(budget_bytes: float, share: float, report: BudgetReport) -> int:
     Returns 0 when RMM is absent (the CPU-only and torch-only paths) or when the
     reinitialisation fails -- in both cases the caller gives torch the whole
     budget, which is correct because nothing else will be allocating.
+
+    When a pool is already installed and this call asks for one no larger, the
+    existing size is returned and nothing is reinitialised: the pool is installed
+    once per process and only ever grows.
     """
+    global _INSTALLED_POOL_BYTES
+
     if share <= 0.0:
-        report.notes.append("rmm not installed or share=0; whole budget goes to torch")
+        report.rmm_note = "rmm not importable or share=0; whole budget goes to torch"
+        report.notes.append(report.rmm_note)
         return 0
 
     try:
         import rmm
     except ImportError:  # resolve_rmm_share already checked, but stay defensive
-        report.notes.append("rmm not installed; cuDF/cuML pool not capped")
+        report.rmm_note = "rmm not importable; cuDF/cuML pool not capped"
+        report.notes.append(report.rmm_note)
         return 0
 
     pool_bytes = int(budget_bytes * share)
     pool_bytes -= pool_bytes % 256  # RMM requires 256-byte aligned pool sizes
+
+    # A pool already installed in this process is never replaced by a smaller one.
+    # reinitialize swaps the memory resource underneath live cuML allocations, so a
+    # late caller applying a different share -- run_variant_cluster_pipeline installs
+    # the TRAINING default (0.25) at import time, and the sweep lazy-imports it for
+    # SigProfiler mid-run -- would otherwise drop the ceiling below the pool already
+    # in use and OOM every subsequent fit.
+    if _INSTALLED_POOL_BYTES is not None and pool_bytes <= _INSTALLED_POOL_BYTES:
+        report.rmm_pool_gb = round(_INSTALLED_POOL_BYTES / BYTES_PER_GB, 2)
+        report.rmm_note = (
+            f"kept the {report.rmm_pool_gb} GB pool already installed in this process "
+            f"rather than shrinking it to {pool_bytes / BYTES_PER_GB:.2f} GB"
+        )
+        report.notes.append(report.rmm_note)
+        return _INSTALLED_POOL_BYTES
+
     try:
         rmm.reinitialize(
             pool_allocator=True,
             initial_pool_size=pool_bytes // 4,
             maximum_pool_size=pool_bytes,
         )
+        _INSTALLED_POOL_BYTES = pool_bytes
         report.rmm_pool_gb = round(pool_bytes / BYTES_PER_GB, 2)
         # Let cuDF spill to host RAM rather than fail when the pool is exhausted.
         os.environ.setdefault("CUDF_SPILL", "1")
         return pool_bytes
     except Exception as exc:  # RMM raises a variety of driver-level errors
-        report.notes.append(f"rmm.reinitialize failed ({type(exc).__name__}: {exc})")
+        report.rmm_note = f"rmm.reinitialize failed ({type(exc).__name__}: {exc})"
+        report.notes.append(report.rmm_note)
         return 0
 
 
@@ -218,10 +254,13 @@ def _finish(report: BudgetReport, verbose: bool) -> BudgetReport:
                 f"{report.device_total_gb} GB = torch {report.torch_budget_gb} GB "
                 f"(fraction {report.torch_fraction})"
             )
-            message += (
-                f" + rmm pool {report.rmm_pool_gb} GB" if report.rmm_pool_gb
-                else " + rmm 0 GB (not installed)"
-            )
+            if report.rmm_pool_gb:
+                message += f" + rmm pool {report.rmm_pool_gb} GB"
+            else:
+                # Never print a bare "not installed" here: an uncapped RMM is the
+                # difference between a sweep that runs and one that OOMs, and the
+                # reason has to be visible in the log at the moment it is decided.
+                message += f" + rmm 0 GB ({report.rmm_note or 'not installed'})"
         else:
             message = f"[gpu_budget] not enforced: {'; '.join(report.notes) or 'no GPU'}"
         print(message, file=sys.stderr, flush=True)
