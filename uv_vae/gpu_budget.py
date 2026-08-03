@@ -211,6 +211,20 @@ def _cap_rmm(budget_bytes: float, share: float, report: BudgetReport) -> int:
 
     pool_bytes = int(budget_bytes * share)
     pool_bytes -= pool_bytes % 256  # RMM requires 256-byte aligned pool sizes
+    if pool_bytes < 256:
+        report.rmm_note = f"share {share} of a {budget_bytes / BYTES_PER_GB:.2f} GB budget rounds to an empty pool"
+        report.notes.append(report.rmm_note)
+        return 0
+
+    # BOTH sizes must be 256-aligned, not just the maximum. pool_bytes // 4 is a
+    # multiple of 64 and only sometimes of 256; when it is not, reinitialize raises
+    # "Initial pool size required to be a multiple of 256 bytes" and the cap is lost
+    # entirely. That is the bug that let a sweep run uncapped: the 0.9 share it asked
+    # for could not install (initial 3,865,470,528) while the 0.25 training default
+    # that later overwrote it could (initial 1,073,741,824), so the only cap that ever
+    # took hold was the wrong one.
+    initial_bytes = pool_bytes // 4
+    initial_bytes -= initial_bytes % 256
 
     # A pool already installed in this process is never replaced by a smaller one.
     # reinitialize swaps the memory resource underneath live cuML allocations, so a
@@ -230,7 +244,7 @@ def _cap_rmm(budget_bytes: float, share: float, report: BudgetReport) -> int:
     try:
         rmm.reinitialize(
             pool_allocator=True,
-            initial_pool_size=pool_bytes // 4,
+            initial_pool_size=initial_bytes,
             maximum_pool_size=pool_bytes,
         )
         _INSTALLED_POOL_BYTES = pool_bytes
