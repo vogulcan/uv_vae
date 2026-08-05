@@ -51,6 +51,7 @@ from uv_vae.model import TabularVAE, VAEConfig
 from uv_vae import gpu_budget
 from uv_vae.preprocess import encode_categorical_column, encode_numeric_column, infer_embedding_dim
 from uv_vae.training import (
+    RunTimer,
     TrainingConfig,
     seed_everything,
     write_json,
@@ -652,6 +653,7 @@ def train_with_early_stopping_streaming(
     ``LatentInference.from_checkpoint`` and the clustering pipeline consume the
     output unchanged.
     """
+    timer = RunTimer()
     early_stopping = early_stopping or EarlyStoppingConfig()
 
     seed_everything(config.seed)
@@ -811,8 +813,10 @@ def train_with_early_stopping_streaming(
         flush=True,
     )
 
+    timer.mark_setup_done()
     progress = tqdm(range(1, config.epochs + 1), desc="epochs", leave=False)
     for epoch in progress:
+        timer.epoch_start()
         train_dataset.set_epoch(epoch)
 
         train_metrics, steps_this_epoch = _run_training_epoch(
@@ -861,6 +865,7 @@ def train_with_early_stopping_streaming(
             "mean_kl": float(diagnostics["mean_kl"]),
             "collapsed_dims": int(diagnostics["collapsed_dims"]),
             "collapsed_pct": float(diagnostics["collapsed_pct"]),
+            "epoch_seconds": timer.epoch_seconds(),
         }
         if convergence_metrics and "procrustes_distance" in convergence_metrics:
             epoch_metrics["procrustes_distance"] = convergence_metrics["procrustes_distance"]
@@ -899,6 +904,10 @@ def train_with_early_stopping_streaming(
                 flush=True,
             )
             break
+
+    # After the loop body so an early-stopped run records the same way a
+    # ceiling-reaching one does -- the `break` above lands here too.
+    timer.mark_loop_done()
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -952,6 +961,7 @@ def train_with_early_stopping_streaming(
         "gpu_budget": budget_report.as_dict(),
         "gpu_batch_budget": batch_budget_report,
         "gpu_environment": gpu_environment,
+        "wall_clock": timer.as_dict(),
     }
     diagnostics_report = {
         "active_unit_threshold": early_stopping.active_unit_threshold,
@@ -1002,6 +1012,7 @@ def train_with_early_stopping_streaming(
         "convergence_tracking": convergence_tracker is not None,
         "effective_batch_size": batch_size,
         "gpu_budget_gb": budget_report.budget_gb if budget_report.enabled else None,
+        "wall_clock": timer.as_dict(),
     }
     write_json(run_dir / "summary.json", summary)
     return run_dir

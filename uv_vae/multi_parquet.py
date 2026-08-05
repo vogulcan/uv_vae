@@ -862,13 +862,21 @@ class InterleavedRowSource:
         return limits
 
     def decode_timings(self) -> dict:
-        """Decode wall-clock summed over every reader, split by stage.
+        """Decode time summed over every reader, split by stage.
 
         Answers the only question that decides whether GPU decode is worth
         enabling: of the time the loader spends not-training, how much is parquet
-        decompression versus the filter, the split hash and the encode. Summed
-        across readers because they are pulled from one at a time on one thread,
-        so the sum IS the wall-clock the GPU spent waiting.
+        decompression versus the filter, the split hash and the encode.
+
+        **These are thread-seconds, not wall-clock, whenever ``decode_workers > 1``.**
+        With one worker the readers are pulled one at a time on one thread and the
+        sum is the wall-clock the GPU spent waiting. With N workers the same sum
+        counts up to N threads concurrently, so it can exceed the run's real
+        duration -- a 4 h 25 m run with 8 workers reported 76 884 s (21 h) here.
+        Do not read ``seconds_total`` as a run duration; the trainer's
+        ``wall_clock`` block in ``training_report.json`` is the duration.
+        ``share`` stays meaningful at any worker count, since the bias is uniform
+        across stages.
         """
         stages = ("read", "filter", "split", "encode")
         totals = {stage: 0.0 for stage in stages}

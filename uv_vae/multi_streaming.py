@@ -50,7 +50,7 @@ from uv_vae.streaming import (
     _run_training_epoch,
     run_val_epoch_with_diagnostics,
 )
-from uv_vae.training import TrainingConfig, seed_everything, write_json
+from uv_vae.training import RunTimer, TrainingConfig, seed_everything, write_json
 
 # Cap on validation rows read per epoch. See InterleavedRowSource.cap_rows: an
 # uncapped site-keyed validation split costs a full pass over every file.
@@ -261,6 +261,7 @@ def train_interleaved(
     warmup_steps: int = 0,
 ) -> Path:
     """Train on every file in ``parquet_paths``, proportionally interleaved."""
+    timer = RunTimer()
     early_stopping = early_stopping or EarlyStoppingConfig()
     split_config = split_config or SplitConfig(
         val_fraction=round(1.0 - config.train_fraction, 10), seed=config.seed
@@ -424,8 +425,11 @@ def train_interleaved(
         flush=True,
     )
 
+    timer.mark_setup_done()
+    prev_decode_seconds = 0.0
     progress = tqdm(range(1, config.epochs + 1), desc="epochs", leave=False)
     for epoch in progress:
+        timer.epoch_start()
         train_dataset.set_epoch(epoch)
 
         train_metrics, steps = _run_training_epoch(
@@ -477,6 +481,7 @@ def train_interleaved(
             "collapsed_pct": float(diagnostics["collapsed_pct"]),
             "train_rows": int(train_source.last_report.rows_emitted),
             "val_rows": int(val_source.last_report.rows_emitted),
+            "epoch_seconds": timer.epoch_seconds(),
         }
         if convergence_metrics and "procrustes_distance" in convergence_metrics:
             epoch_metrics["procrustes_distance"] = convergence_metrics["procrustes_distance"]
@@ -512,8 +517,15 @@ def train_interleaved(
         decode = train_source.decode_timings()
         if decode["seconds_total"] > 0:
             share = decode["share"]
+            # Wall time next to cumulative decode: the decode figure alone cannot
+            # say whether the loader was the constraint, because it overlaps the
+            # GPU. epoch_seconds close to this epoch's decode delta means the
+            # loader is; much larger means the GPU is and the loader keeps up.
+            decode_delta = decode["seconds_total"] - prev_decode_seconds
+            prev_decode_seconds = decode["seconds_total"]
             print(
-                f"  epoch {epoch} decode [{decode['backend']}] "
+                f"  epoch {epoch} wall {epoch_metrics['epoch_seconds']:.1f}s -- "
+                f"decode [{decode['backend']}] {decode_delta:.1f}s this epoch, "
                 f"{decode['seconds_total']:.1f}s cumulative over "
                 f"{decode['groups_decoded']:,} row groups -- "
                 f"read {share['read']:.0%} filter {share['filter']:.0%} "
@@ -532,6 +544,10 @@ def train_interleaved(
                 flush=True,
             )
             break
+
+    # After the loop body so an early-stopped run records the same way a
+    # ceiling-reaching one does -- the `break` above lands here too.
+    timer.mark_loop_done()
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -624,6 +640,7 @@ def train_interleaved(
         "gpu_budget": budget_report.as_dict(),
         "gpu_batch_budget": batch_budget_report,
         "gpu_environment": gpu_environment,
+        "wall_clock": timer.as_dict(),
     }
     diagnostics_report = {
         "active_unit_threshold": early_stopping.active_unit_threshold,
@@ -680,6 +697,7 @@ def train_interleaved(
         "convergence_tracking": convergence_tracker is not None,
         "effective_batch_size": batch_size,
         "gpu_budget_gb": budget_report.budget_gb if budget_report.enabled else None,
+        "wall_clock": timer.as_dict(),
     }
     write_json(run_dir / "summary.json", summary)
     return run_dir

@@ -37,6 +37,7 @@ from uv_vae.features import load_feature_specs
 from uv_vae.model import TabularVAE
 from uv_vae.preprocess import prepare_tensors
 from uv_vae.training import (
+    RunTimer,
     TrainingConfig,
     build_model,
     run_epoch,
@@ -215,6 +216,7 @@ def train_with_early_stopping(
     delegated to the existing pipeline functions, so a run here is directly comparable to
     a stock run with the same seed and config.
     """
+    timer = RunTimer()
     early_stopping = early_stopping or EarlyStoppingConfig()
 
     seed_everything(config.seed)
@@ -286,8 +288,10 @@ def train_with_early_stopping(
     diagnostics_history: list[dict[str, object]] = []
     best_state: dict[str, torch.Tensor] | None = None
 
+    timer.mark_setup_done()
     progress = tqdm(range(1, config.epochs + 1), desc="epochs", leave=False)
     for epoch in progress:
+        timer.epoch_start()
         train_metrics = run_epoch(
             model=model,
             loader=train_loader,
@@ -327,6 +331,7 @@ def train_with_early_stopping(
             "mean_kl": float(diagnostics["mean_kl"]),
             "collapsed_dims": int(diagnostics["collapsed_dims"]),
             "collapsed_pct": float(diagnostics["collapsed_pct"]),
+            "epoch_seconds": timer.epoch_seconds(),
         }
         history.append(epoch_metrics)
         diagnostics_history.append({"epoch": epoch, **diagnostics})
@@ -357,6 +362,10 @@ def train_with_early_stopping(
                 flush=True,
             )
             break
+
+    # After the loop body so an early-stopped run records the same way a
+    # ceiling-reaching one does -- the `break` above lands here too.
+    timer.mark_loop_done()
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -398,6 +407,7 @@ def train_with_early_stopping(
         "config": asdict(config),
         "early_stopping": early_stopping_report,
         "history": history,
+        "wall_clock": timer.as_dict(),
     }
     diagnostics_report = {
         "active_unit_threshold": early_stopping.active_unit_threshold,
@@ -436,6 +446,7 @@ def train_with_early_stopping(
         "sample_only_null_features": prepared.dropped_sample_null_features,
         "early_stopping": early_stopping_report,
         "final_epoch": history[-1] if history else {},
+        "wall_clock": timer.as_dict(),
     }
     write_json(run_dir / "summary.json", summary)
     return run_dir
