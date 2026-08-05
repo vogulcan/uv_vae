@@ -41,6 +41,7 @@ from uv_vae.multi_parquet import (
     InterleavedRowSource,
     RowEncoder,
     SampleSource,
+    gpu_decode_requested,
 )
 from uv_vae.splitting import SplitConfig
 from uv_vae.stats_cache import load_or_compute_stats
@@ -190,6 +191,56 @@ def _rmm_share_for_interleaved() -> float | None:
     return 0.0
 
 
+ALLOW_GPU_DECODE_WORKERS_ENV = "UV_VAE_ALLOW_GPU_DECODE_WORKERS"
+
+
+def _resolve_decode_workers(decode_workers: int) -> int:
+    """Clamp ``decode_workers`` to 1 while the cuDF decode path is active.
+
+    ``decode_workers > 1`` keeps that many row-group decodes in flight per reader.  On
+    the CPU path each is a host allocation of tens of MB and harmless -- the setting
+    exists because encode and split are single-threaded numpy and were measured at
+    ~47% of decode time.  Under ``UV_VAE_GPU_DECODE=1`` those same decodes come out of
+    the bounded RMM pool instead (``DEFAULT_RMM_SHARE`` 0.25 of a 16 GB budget = 4 GB),
+    and N in flight multiply into it.  The resulting OOM lands partway through an epoch,
+    hours into a run.
+
+    Clamping rather than raising is deliberate.  1 is the sequential path every existing
+    result came from, so it is always correct and merely slower, whereas an exception
+    would turn a recoverable misconfiguration into a failed job.  The reason to want
+    extra workers also largely evaporates here: the GPU path moves encode and split onto
+    the device as well, which is the bottleneck they were added to hide.
+
+    Set ``UV_VAE_ALLOW_GPU_DECODE_WORKERS=1`` to keep the requested count once the pool
+    has been measured to have room for it.
+    """
+    if decode_workers <= 1 or not gpu_decode_requested():
+        return decode_workers
+    if os.environ.get(ALLOW_GPU_DECODE_WORKERS_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }:
+        print(
+            f"[multi_streaming] {ALLOW_GPU_DECODE_WORKERS_ENV} is set: keeping "
+            f"decode_workers={decode_workers} with UV_VAE_GPU_DECODE=1. Peak RMM use "
+            f"is ~{decode_workers}x one decoded row group; watch the pool.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return decode_workers
+    print(
+        f"[multi_streaming] decode_workers={decode_workers} requested with "
+        f"UV_VAE_GPU_DECODE=1; clamping to 1 so concurrent cuDF decodes cannot "
+        f"exhaust the RMM pool. The GPU path already offloads encode+split, which is "
+        f"what extra workers were hiding. Override with "
+        f"{ALLOW_GPU_DECODE_WORKERS_ENV}=1.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return 1
+
+
 def train_interleaved(
     config: TrainingConfig,
     parquet_paths: list[str],
@@ -299,6 +350,9 @@ def train_interleaved(
     global_step = 0
 
     # ---- interleaved loaders ----
+    # Rebind before the report is built, so sampling_report["decode_workers"] records
+    # what actually ran rather than what was asked for.
+    decode_workers = _resolve_decode_workers(decode_workers)
     encoder = RowEncoder(
         categorical_specs=stats.categorical_specs,
         numeric_specs=stats.numeric_specs,
