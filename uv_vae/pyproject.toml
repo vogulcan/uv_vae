@@ -14,6 +14,10 @@ dependencies = [
     "polars",
     "pyarrow",
     "pyyaml",
+    # Imported directly by convergence.py, evaluation.py and latent_metrics.py --
+    # convergence.py is on the training path (--test-parquet-path). It used to
+    # arrive only transitively via umap-learn/hdbscan.
+    "scikit-learn",
     "sigprofilerassignment>=1.1.3",
     "torch",
     "tqdm",

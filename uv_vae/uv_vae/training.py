@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import os
 import random
-from dataclasses import asdict, dataclass
+import time
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -39,6 +40,7 @@ class TrainingConfig:
     train_fraction: float
     seed: int
     threads: int | None
+    data_seed: int | None = None
 
 
 def seed_everything(seed: int) -> None:
@@ -151,7 +153,89 @@ def write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True))
 
 
+@dataclass
+class RunTimer:
+    """End-to-end wall clock for one training run.
+
+    The existing decode timings measure only the loader, and the loader runs
+    *concurrently* with the GPU, so they cannot be summed into a run duration and
+    cannot say which side was the bottleneck. This records the actual clock.
+
+    Compare ``epoch_seconds`` against the per-epoch decode delta: if they track each
+    other the loader is the constraint (more ``decode_workers``, ``pre_buffer``);
+    if ``epoch_seconds`` is much larger the GPU is, and the loader is already
+    keeping up.
+
+    Durations come from ``perf_counter`` (monotonic — a clock adjustment mid-run
+    cannot produce a negative epoch); the ISO timestamps are wall clock and are
+    there so a run can be lined up against cluster logs.
+    """
+
+    started_utc: str = field(
+        default_factory=lambda: datetime.now(UTC).isoformat(timespec="seconds")
+    )
+    _t0: float = field(default_factory=time.perf_counter, repr=False)
+    _setup_seconds: float | None = field(default=None, repr=False)
+    _loop_seconds: float | None = field(default=None, repr=False)
+    _epoch_t0: float | None = field(default=None, repr=False)
+    _epochs: list[float] = field(default_factory=list, repr=False)
+
+    def mark_setup_done(self) -> None:
+        """Call once, immediately before the epoch loop."""
+        self._setup_seconds = time.perf_counter() - self._t0
+
+    def mark_loop_done(self) -> None:
+        """Call once, immediately after the epoch loop (including on early stop)."""
+        setup = self._setup_seconds or 0.0
+        self._loop_seconds = (time.perf_counter() - self._t0) - setup
+
+    def epoch_start(self) -> None:
+        self._epoch_t0 = time.perf_counter()
+
+    def epoch_seconds(self) -> float:
+        """Seconds since the matching ``epoch_start``; 0.0 if it was never called.
+
+        Recorded for the ``epoch_*_seconds`` aggregates, so call it exactly once per
+        epoch — the value goes in that epoch's history entry.
+        """
+        if self._epoch_t0 is None:
+            return 0.0
+        elapsed = round(time.perf_counter() - self._epoch_t0, 3)
+        self._epochs.append(elapsed)
+        return elapsed
+
+    def as_dict(self) -> dict[str, object]:
+        """The wall-clock block. Call at artifact-write time, not before."""
+        total = time.perf_counter() - self._t0
+        setup = self._setup_seconds
+        loop = self._loop_seconds
+        return {
+            "started_utc": self.started_utc,
+            "finished_utc": datetime.now(UTC).isoformat(timespec="seconds"),
+            "total_seconds": round(total, 3),
+            "total_hours": round(total / 3600.0, 4),
+            "setup_seconds": None if setup is None else round(setup, 3),
+            "train_loop_seconds": None if loop is None else round(loop, 3),
+            # Everything after the loop: best-weight restore, artifact writes,
+            # torch.save of the checkpoint.
+            "finalize_seconds": (
+                None
+                if (setup is None or loop is None)
+                else round(total - setup - loop, 3)
+            ),
+            # Carried here rather than left to be re-derived from `history`, because
+            # train_result.json (what the tmux runner prints) keeps only final_epoch.
+            "epochs_timed": len(self._epochs),
+            "epoch_mean_seconds": (
+                round(sum(self._epochs) / len(self._epochs), 3) if self._epochs else None
+            ),
+            "epoch_min_seconds": min(self._epochs) if self._epochs else None,
+            "epoch_max_seconds": max(self._epochs) if self._epochs else None,
+        }
+
+
 def train(config: TrainingConfig) -> Path:
+    timer = RunTimer()
     seed_everything(config.seed)
     output_root = Path(config.output_dir)
     run_dir = output_root / datetime.now(UTC).strftime("run_%Y%m%dT%H%M%SZ")
@@ -178,13 +262,14 @@ def train(config: TrainingConfig) -> Path:
         )
 
     # DuckDB's REPEATABLE sampling is only deterministic with a single thread.
+    sampling_seed = config.data_seed if config.data_seed is not None else config.seed
     with connect_duckdb(threads=1) as sample_conn:
         sampled_frame = sample_frame(
             conn=sample_conn,
             parquet_path=config.parquet_path,
             feature_names=feature_names,
             sample_rows=sample_rows,
-            seed=config.seed,
+            seed=sampling_seed,
             where=config.row_filter,
         )
 
@@ -200,6 +285,14 @@ def train(config: TrainingConfig) -> Path:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.set_float32_matmul_precision("highest")
+
+    # Cap GPU memory before anything allocates. Tensors stay in host RAM here
+    # (TensorDataset) and only a batch at a time crosses to the device, so this
+    # path is light -- but the cap still stops a large --batch-size from expanding
+    # into a card that other work is sharing.
+    from uv_vae import gpu_budget  # local import: keeps torch-free imports of this module cheap
+
+    budget_report = gpu_budget.apply()
 
     train_loader = DataLoader(
         TensorDataset(prepared.train_cat, prepared.train_num, prepared.train_mask),
@@ -221,8 +314,10 @@ def train(config: TrainingConfig) -> Path:
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
 
     history: list[dict[str, float | int]] = []
+    timer.mark_setup_done()
     progress = tqdm(range(1, config.epochs + 1), desc="epochs", leave=False)
     for epoch in progress:
+        timer.epoch_start()
         train_metrics = run_epoch(
             model=model,
             loader=train_loader,
@@ -246,12 +341,15 @@ def train(config: TrainingConfig) -> Path:
             "val_numeric_loss": val_metrics["numeric_loss"],
             "val_categorical_loss": val_metrics["categorical_loss"],
             "val_kl_loss": val_metrics["kl_loss"],
+            "epoch_seconds": timer.epoch_seconds(),
         }
         history.append(epoch_metrics)
         progress.set_postfix(
             train=f"{train_metrics['total_loss']:.4f}",
             val=f"{val_metrics['total_loss']:.4f}",
         )
+
+    timer.mark_loop_done()
 
     feature_report = {
         "row_filter": config.row_filter,
@@ -275,6 +373,9 @@ def train(config: TrainingConfig) -> Path:
         "cuda_available": torch.cuda.is_available(),
         "config": asdict(config),
         "history": history,
+        "gpu_budget": budget_report.as_dict(),
+        "gpu_environment": gpu_budget.describe_environment(),
+        "wall_clock": timer.as_dict(),
     }
 
     write_json(run_dir / "feature_report.json", feature_report)
@@ -302,6 +403,7 @@ def train(config: TrainingConfig) -> Path:
         "all_null_features": prepared.dropped_all_null_features,
         "sample_only_null_features": prepared.dropped_sample_null_features,
         "final_epoch": history[-1] if history else {},
+        "wall_clock": timer.as_dict(),
     }
     write_json(run_dir / "summary.json", summary)
     return run_dir

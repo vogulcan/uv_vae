@@ -1,18 +1,10 @@
-# Python-generated files
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-.numba_cache/
-
-# Virtual environments
-.venv
-
-# Data
-data/
-
-# Training outputs
-artifacts/
-
+*.pyc
+*.egg-info/
+.venv/
+models/
+results/
+runs/
+*.npy
+*.pkl
+*.pt

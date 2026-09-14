@@ -1,0 +1,31 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.numba_cache/
+
+# Virtual environments
+.venv
+
+# Data
+data/
+
+# Training outputs
+artifacts/
+
+# sweep results
+sweep_results/
+
+# claude code
+.claude/
+
+# pytest
+.pytest_cache/
+
+# NOTE: `tests/` used to be ignored here, which kept the whole suite out of the
+# repo -- including the three existing tests and the `uv run pytest tests/`
+# command CLAUDE.md documents. Tests are source, so they are tracked now.
+
