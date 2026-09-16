@@ -1,5 +1,11 @@
 # UV_VAE Deployment — File Manifest
 
+> **Note:** this manifest describes the full deployment folder kept by the lab on miletus
+> (`~/uv_vae_deployment`), including the trained models, cohort results and the parameter-sweep
+> and plotting code. This repository contains only the code subset needed for inference and
+> retraining — see [`README.md`](README.md). Files listed below under `models/`, `results/` and
+> `plots/`, and sweep modules not present in this checkout, exist only in that folder.
+
 Everything required to reproduce or re-run the full pipeline:
 **parquet → VAE → latent → parametric UMAP → HDBSCAN → SigProfiler (`uv_only`)**
 
