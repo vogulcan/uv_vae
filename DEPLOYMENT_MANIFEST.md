@@ -16,7 +16,7 @@ Parameters for every stage are in [`pipeline_parameters.md`](pipeline_parameters
 ## Layout
 
 ```
-UV_VAE_Deployment/
+uv_vae_deployment/
 ├── RUNNING_INFERENCE.md            apply the checkpoints to new data  ← start here
 ├── REBUILDING_MODELS.md            retrain VAE / UMAP / HDBSCAN from scratch
 ├── ACCESSING_ASSIGNMENTS.md        how to read coordinates + labels back per row

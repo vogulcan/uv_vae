@@ -164,7 +164,7 @@ to get past the refusal.
 
 ## 7. Rebuilding
 
-**Three inputs are required, and none of them are in `UV_VAE_Deployment/`:**
+**Three inputs are required, and none of them are in `uv_vae_deployment/`:**
 
 | Input | Where | Size |
 |---|---|---|
@@ -202,7 +202,7 @@ another machine, rewrite the prefixes with `--source-root` / `--new-source-root`
 
 ## 7b. Cohort-level data needs none of this
 
-`UV_VAE_Deployment/models/coords/` holds a **different** set of coordinates and labels — one
+`uv_vae_deployment/models/coords/` holds a **different** set of coordinates and labels — one
 row per deduplicated locus rather than per read:
 
 | File | Rows |
