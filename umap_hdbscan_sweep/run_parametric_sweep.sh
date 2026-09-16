@@ -36,10 +36,15 @@
 #   tmux attach -t paramsweep3        # to watch
 set -uo pipefail
 
-REPO="${REPO:-$HOME/pure-internship}"
+# REPO defaults to the deployment root this script sits in, so the sweep runs the scripts
+# beside it rather than a checkout elsewhere.
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 SWEEP_DIR="$REPO/umap_hdbscan_sweep"
-EMBED_DIR="${EMBED_DIR:-$REPO/uv_vae/runs/train_multi_20260802T192756Z/stage1_embed}"
-OUT_ROOT="${OUT_ROOT:-$SWEEP_DIR/umap_tests/parametric_sweep}"
+# EMBED_DIR must hold latent.npy + context.parquet: stage1_embed.py's output. To refit UMAP on
+# the shipped VAE latent without re-embedding, link the files in models/coords/ under those
+# names (see REBUILDING_MODELS.md section 3).
+EMBED_DIR="${EMBED_DIR:-$REPO/runs/stage1_embed}"
+OUT_ROOT="${OUT_ROOT:-$REPO/runs/parametric_sweep}"
 
 WAIT_FOR_SESSION="${WAIT_FOR_SESSION:-}"
 REQUIRE_FREE_GB="${REQUIRE_FREE_GB:-40}"

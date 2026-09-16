@@ -39,7 +39,15 @@ set -euo pipefail
 # Repo layout differs by cluster: on miletus the branch is a git clone at
 # ~/pure-internship, on tosun the folders are deployed as siblings in $HOME.
 # Probe rather than hardcode so one script serves both; an explicit export
-# still wins over either.
+# still wins over either. The deployment folder this script sits in is checked
+# first, so a deployment trains with its own package and CLI.
+DEPLOY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+if [ -z "${UV_VAE_DIR:-}" ] && [ -d "$DEPLOY_ROOT/uv_vae/uv_vae" ]; then
+    UV_VAE_DIR="$DEPLOY_ROOT/uv_vae"
+fi
+if [ -z "${EARLY_STOPPING_DIR:-}" ] && [ -d "$DEPLOY_ROOT/Early_Stopping_Tests/Python Files" ]; then
+    EARLY_STOPPING_DIR="$DEPLOY_ROOT/Early_Stopping_Tests"
+fi
 if [ -z "${UV_VAE_DIR:-}" ] && [ -d "$HOME/pure-internship/uv_vae" ]; then
     UV_VAE_DIR="$HOME/pure-internship/uv_vae"
 fi
@@ -54,7 +62,11 @@ source "$UV_VAE_DIR/scripts/tmux_lib.sh"
 
 # ── Configuration ───────────────────────────────────────────────────────────
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
-RUN_ROOT="${RUN_ROOT:-$UV_VAE_DIR/runs/train_multi_$RUN_ID}"
+if [ "$UV_VAE_DIR" = "$DEPLOY_ROOT/uv_vae" ]; then
+    RUN_ROOT="${RUN_ROOT:-$DEPLOY_ROOT/runs/train_multi_$RUN_ID}"
+else
+    RUN_ROOT="${RUN_ROOT:-$UV_VAE_DIR/runs/train_multi_$RUN_ID}"
+fi
 ROW_FILTER="${ROW_FILTER:-st = 'MIXED' AND et = 'MIXED' AND FILT = 1}"
 SEED="${SEED:-42}"
 SESSION="${SESSION:-train_multi}"

@@ -22,13 +22,16 @@ elif command -v conda &>/dev/null; then
     conda activate "${CONDA_ENV:-patrickg}"
 fi
 
-# ── default paths (miletus) ─────────────────────────────────────────────────────
+# ── default paths: the shipped models inside this deployment folder ─────────────
+# REPO_ROOT is the deployment root (the folder holding models/, uv_vae/, umap_hdbscan_sweep/).
+# To label against a retrained model instead, override CHECKPOINT / UMAP_MODEL / COORDS /
+# CONTEXT / MODEL_DIR with the new files under runs/.
 PARQUET_GLOB="${PARQUET_GLOB:-/data/lab/ppmseq_parquets/*.parquet}"
-CHECKPOINT="${CHECKPOINT:-$HOME/pure-internship/uv_vae/runs/train_multi_20260802T192756Z/training/run_20260802T192814Z/model.pt}"
-FEATURE_SPEC="${FEATURE_SPEC:-$HOME/pure-internship/uv_vae/ml_features.json}"
-UMAP_MODEL="${UMAP_MODEL:-$HOME/pure-internship/umap_hdbscan_sweep/umap/results/final_models/13_BEST_25M_nn15_md0.1_umap.pt}"
-COORDS="${COORDS:-$HOME/pure-internship/umap_hdbscan_sweep/hdbscan/results/hdbscan_scaling/coords.npy}"
-CONTEXT="${CONTEXT:-$HOME/pure-internship/uv_vae/runs/train_multi_20260802T192756Z/stage1_embed/context.parquet}"
+CHECKPOINT="${CHECKPOINT:-$REPO_ROOT/models/vae/model.pt}"
+FEATURE_SPEC="${FEATURE_SPEC:-$REPO_ROOT/uv_vae/ml_features.json}"
+UMAP_MODEL="${UMAP_MODEL:-$REPO_ROOT/models/umap/13_BEST_25M_nn15_md0.1_umap.pt}"
+COORDS="${COORDS:-$REPO_ROOT/models/coords/umap_coords_2d.npy}"
+CONTEXT="${CONTEXT:-$REPO_ROOT/models/coords/context.parquet}"
 
 # Reuse the cohort HDBSCAN rather than refitting here, so per-sample labels are directly
 # comparable to the cohort run and to each other. Which model that is has changed:
@@ -43,9 +46,17 @@ CONTEXT="${CONTEXT:-$HOME/pure-internship/uv_vae/runs/train_multi_20260802T19275
 # two produce different partitions and cluster ids are not comparable across them.
 CLUSTER_BACKEND="${CLUSTER_BACKEND:-cuml}"
 CELL="${CELL:-fit1000000_mcs2500_ms15_eom}"
-MODEL_DIR="${MODEL_DIR:-$HOME/pure-internship/umap_hdbscan_sweep/hdbscan/results/final_models/$CLUSTER_BACKEND/cells/$CELL}"
+# models/hdbscan/ holds the shipped cuML model for the selected cell. Any other backend or
+# cell has to be fitted first with tmux_final_models.sh, which writes to runs/final_models/.
+if [ -z "${MODEL_DIR:-}" ]; then
+    if [ "$CLUSTER_BACKEND" = "cuml" ] && [ "$CELL" = "fit1000000_mcs2500_ms15_eom" ]; then
+        MODEL_DIR="$REPO_ROOT/models/hdbscan"
+    else
+        MODEL_DIR="$REPO_ROOT/runs/final_models/$CLUSTER_BACKEND/cells/$CELL"
+    fi
+fi
 
-OUTPUT_DIR="${OUTPUT_DIR:-$HOME/pure-internship/umap_hdbscan_sweep/per_parquet_inference_$CLUSTER_BACKEND}"
+OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/results/per_parquet_inference_$CLUSTER_BACKEND}"
 
 # Set HDBSCAN_MODEL="" to make this script fit its own CPU model with MCS/MS/EPSILON below.
 HDBSCAN_MODEL="${HDBSCAN_MODEL:-$MODEL_DIR/hdbscan_model.pkl}"

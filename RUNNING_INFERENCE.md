@@ -64,8 +64,10 @@ tmux new-session -d -s inference 'bash umap_hdbscan_sweep/tmux_per_parquet_infer
 tmux attach -t inference
 ```
 
-The runner has the deployment paths filled in. Override with `PARQUET_GLOB`, `OUTPUT_DIR`,
-`MODEL_DIR`, `GPU_BUDGET_GB`; `SKIP_DONE=1` resumes without redoing finished samples.
+The runner defaults to the shipped models in this folder's `models/` and writes to
+`results/per_parquet_inference_cuml/`. Override with `PARQUET_GLOB`, `OUTPUT_DIR`,
+`MODEL_DIR`, `GPU_BUDGET_GB`; `SKIP_DONE=1` resumes without redoing finished samples. To use
+rebuilt models instead, see [`REBUILDING_MODELS.md` §4](REBUILDING_MODELS.md).
 
 **Check the header before walking away**: the model path, and that the cohort cluster count
 reads **175**. A run pointed at the wrong cell is only obvious here.
@@ -76,7 +78,7 @@ Cost: ~15 min/sample, so ~24 h for 95. Peak VRAM 19.7 GB against the 44 GB defau
 <summary>Direct CLI form</summary>
 
 ```bash
-DEPLOY=~/pure-internship/UV_VAE_Deployment
+DEPLOY=$(pwd)    # run from the deployment root
 
 python umap_hdbscan_sweep/per_parquet_inference.py \
     --parquet-glob   '/path/to/new_samples/*.parquet' \

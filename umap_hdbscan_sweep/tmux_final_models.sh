@@ -40,9 +40,12 @@ elif command -v conda &>/dev/null; then
     conda activate "${CONDA_ENV:-patrickg}"
 fi
 
-COORDS="${COORDS:-$HOME/pure-internship/umap_hdbscan_sweep/hdbscan/results/hdbscan_scaling/coords.npy}"
-CONTEXT="${CONTEXT:-$HOME/pure-internship/uv_vae/runs/train_multi_20260802T192756Z/stage1_embed/context.parquet}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-$HOME/pure-internship/umap_hdbscan_sweep/hdbscan/results/final_models}"
+# Defaults refit on the shipped UMAP coordinates in this deployment folder. After a UMAP
+# refit, point COORDS (and CONTEXT, if stage 1 was re-run) at the new files under runs/.
+# Output goes to runs/, never models/, so a refit cannot overwrite the shipped model.
+COORDS="${COORDS:-$REPO_ROOT/models/coords/umap_coords_2d.npy}"
+CONTEXT="${CONTEXT:-$REPO_ROOT/models/coords/context.parquet}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$REPO_ROOT/runs/final_models}"
 
 # The selected cell. Overridable, but these five values ARE the published configuration --
 # changing one makes the output a different model than pipeline_parameters.md section 3

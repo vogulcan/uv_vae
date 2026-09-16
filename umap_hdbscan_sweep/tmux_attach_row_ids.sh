@@ -18,7 +18,7 @@ elif command -v conda &>/dev/null; then
 fi
 
 PARQUET_GLOB="${PARQUET_GLOB:-/data/lab/ppmseq_parquets/*.parquet}"
-RESULTS_DIR="${RESULTS_DIR:-$HOME/pure-internship/umap_hdbscan_sweep/per_parquet_inference}"
+RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/results/per_parquet_inference_cuml}"
 
 LOG="$RESULTS_DIR/attach_row_ids_$(date -u +%Y%m%dT%H%M%SZ).log"
 mkdir -p "$RESULTS_DIR"

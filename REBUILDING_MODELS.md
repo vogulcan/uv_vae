@@ -14,6 +14,19 @@ models** — for that see [`RUNNING_INFERENCE.md`](RUNNING_INFERENCE.md).
 | Parameters the shipped models used | [`pipeline_parameters.md`](pipeline_parameters.md) |
 | Applying the result once rebuilt | [`RUNNING_INFERENCE.md`](RUNNING_INFERENCE.md) |
 
+**Where things live.** Run every command from the deployment root. The runners default to the
+shipped models in `models/` and write anything new to `runs/`, so a rebuild never overwrites
+`models/`. To keep a rebuilt model, point the next stage (or inference) at its `runs/` path.
+
+| Stage output | Shipped copy | A rebuild writes to |
+|---|---|---|
+| VAE checkpoint | `models/vae/model.pt` | `runs/train_multi_<id>/training/run_<ts>/model.pt` |
+| Dedup | — | `runs/dedup/` (`dedup_manifest.json`) |
+| Latent + context | `models/coords/vae_latent_16d.npy`, `context.parquet` | `runs/stage1_embed/` (`latent.npy`, `context.parquet`) |
+| UMAP encoder | `models/umap/13_BEST_25M_nn15_md0.1_umap.pt` | `runs/parametric_sweep/` |
+| UMAP coordinates | `models/coords/umap_coords_2d.npy` | `runs/umap_apply/<cell>/coords.npy` |
+| HDBSCAN model | `models/hdbscan/` | `runs/final_models/<backend>/cells/<cell>/` |
+
 ---
 
 ## 1. The chain
@@ -47,7 +60,8 @@ tmux new-session -d -s train_multi 'bash Early_Stopping_Tests/scripts/tmux_train
 ```
 
 The runner's defaults **are** the shipped configuration, so this reproduces
-`models/vae/model.pt`. Everything is overridable — 41 environment variables in the runner, 33
+`models/vae/model.pt`. It trains with this folder's own `uv_vae/` package and writes to
+`runs/train_multi_<id>/`. Everything is overridable — 41 environment variables in the runner, 33
 `--flags` on the CLI beneath it:
 
 ```bash
@@ -81,10 +95,39 @@ means latent dimensions collapsed — don't use that run.
 
 ---
 
+## 2b. Dedup and VAE encode (stages 0 and 2)
+
+Only needed after retraining the VAE. Stage 0 fixes the row order that every later array is
+aligned to, so run it once and then stage 2 against the same output:
+
+```bash
+python umap_hdbscan_sweep/stage0_dedup.py \
+    --parquet-paths '/data/lab/ppmseq_parquets/*.parquet' \
+    --checkpoint-path runs/train_multi_<id>/training/run_<ts>/model.pt \
+    --output-dir runs/dedup
+
+python umap_hdbscan_sweep/stage1_embed.py \
+    --dedup-manifest runs/dedup/dedup_manifest.json \
+    --checkpoint-path runs/train_multi_<id>/training/run_<ts>/model.pt \
+    --feature-spec-path uv_vae/ml_features.json \
+    --output-dir runs/stage1_embed
+```
+
+---
+
 ## 3. Refitting UMAP (stages 3–4)
 
 ```bash
 bash umap_hdbscan_sweep/run_parametric_sweep.sh
+```
+
+It reads `latent.npy` and `context.parquet` from `runs/stage1_embed/`. **To refit UMAP on the
+shipped VAE instead** (no VAE retrain), link the shipped arrays in under those names first:
+
+```bash
+mkdir -p runs/stage1_embed
+ln -s ../../models/coords/vae_latent_16d.npy runs/stage1_embed/latent.npy
+ln -s ../../models/coords/context.parquet    runs/stage1_embed/context.parquet
 ```
 
 Sweeps `SIZES=2000000,5000000,10000000,25000000` × `NN=15,30,50` ×
@@ -119,7 +162,11 @@ python umap_hdbscan_sweep/parametric_sweep.py \
 Then project the whole cohort to get a new `coords.npy`:
 
 ```bash
-python umap_hdbscan_sweep/apply_parametric_full.py --help
+python umap_hdbscan_sweep/apply_parametric_full.py \
+    --sweep-json runs/parametric_sweep/<run>/parametric_sweep.json \
+    --embed-dir runs/stage1_embed --output-dir runs/umap_apply \
+    --cells <selected cell> --save-coords
+# writes runs/umap_apply/<cell>/coords.npy; see --help for the remaining options
 ```
 
 > **Cluster counts are seed-sensitive** — 508–533 at 25 M and 142–184 at 5 M with nothing
@@ -141,13 +188,25 @@ the two are comparable. The full 24-cell sweep is opt-in via `FULL_GRID=1`. Use
 `BACKENDS=cuml` to skip the CPU cross-check, which exists only for the diagnostics cuML does
 not expose.
 
-**After a retrain you must override `COORDS` and `CONTEXT`.** They default to the
-August-2026 run's paths, so a bare invocation clusters the *old* embedding while appearing to
-succeed:
+Output goes to `runs/final_models/`; `models/hdbscan/` is never overwritten.
+
+**After a UMAP or VAE retrain you must override `COORDS` and `CONTEXT`.** They default to the
+shipped `models/coords/` arrays, so a bare invocation clusters the *old* embedding while
+appearing to succeed:
 
 ```bash
-COORDS=<new>/coords.npy CONTEXT=<new>/context.parquet \
+COORDS=runs/umap_apply/<cell>/coords.npy CONTEXT=runs/stage1_embed/context.parquet \
   bash umap_hdbscan_sweep/tmux_final_models.sh
+```
+
+Then label samples with the rebuilt models by overriding the inference runner's defaults:
+
+```bash
+CHECKPOINT=runs/train_multi_<id>/training/run_<ts>/model.pt \
+UMAP_MODEL=<rebuilt encoder .pt> COORDS=runs/umap_apply/<cell>/coords.npy \
+CONTEXT=runs/stage1_embed/context.parquet \
+MODEL_DIR=runs/final_models/cuml/cells/fit1000000_mcs2500_ms15_eom \
+  bash umap_hdbscan_sweep/tmux_per_parquet_inference.sh
 ```
 
 > **Always name the backend in the output directory, and check it afterwards.**
